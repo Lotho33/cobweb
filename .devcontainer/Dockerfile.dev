@@ -1,0 +1,21 @@
+FROM rust:1-bookworm
+
+# Build/runtime deps:
+#  - cmake + clang: wreq's TLS backend (btls / BoringSSL) is built from source
+#  - chromium + fonts: the M2 browser tier (hand-rolled CDP client drives it)
+#  - xvfb + x11vnc: headed-under-Xvfb (M2c) + the manual VNC solve (M3)
+#  - jq + curl: poking the API by hand
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake clang \
+      chromium fonts-liberation ca-certificates \
+      xvfb x11vnc \
+      jq curl \
+ && rm -rf /var/lib/apt/lists/*
+ENV CC=clang CXX=clang++
+# cobweb's [browser].chromium_path defaults to "auto" → finds /usr/bin/chromium on PATH.
+
+RUN rustup component add clippy rustfmt \
+ && cargo install cargo-watch --locked
+
+# Live-reload loop, mirroring mycelium's `air`:
+#   cargo watch -x 'run --no-default-features -- --config config.dev.toml'

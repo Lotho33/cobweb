@@ -1,0 +1,29 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    # Mount the whole Dev/Rust parent so sibling repos (mycelium-core, etc.) are
+    # reachable from the container, same as mycelium's dev compose.
+    volumes:
+      - ../..:/workspace:cached,z
+      - cobweb-cargo-registry:/usr/local/cargo/registry
+      - cobweb-target:/workspace/cobweb/target
+    working_dir: /workspace/cobweb
+    command: sleep infinity
+    # PID 1 must reap: Chromium orphans (from a killed `cargo run`) otherwise
+    # pile up as unkillable zombies. `init` runs tini/catatonit as PID 1.
+    init: true
+    ports:
+      - "8191:8191"
+    environment:
+      - COBWEB_CONFIG=/workspace/cobweb/config.dev.toml
+      - RUST_LOG=info,cobweb=debug,tower_http=info
+      - CARGO_TERM_COLOR=always
+      - TZ=Europe/Rome
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  cobweb-cargo-registry:
+  cobweb-target:

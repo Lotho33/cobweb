@@ -1,0 +1,80 @@
+[package]
+name = "cobweb"
+version = "1.0.7"
+edition = "2021"
+rust-version = "1.82"
+description = "Self-hosted headless-browser fetch sidecar: resolves HLS/DASH stream URLs from player pages an operator is authorised to access, with a persistent per-domain cookie jar."
+license = "MIT"
+repository = "https://github.com/Lotho33/cobweb"
+default-run = "cobweb"
+
+[[bin]]
+name = "cobweb"
+path = "src/main.rs"
+
+# The crate is also a library so `tests/` can drive the pipeline directly
+# (spin up the axum app on an ephemeral port) without going through the binary.
+[lib]
+name = "cobweb"
+path = "src/lib.rs"
+
+[features]
+# `ytdlp` is deliberately NOT in `default`: it shells out to a fast-moving,
+# heavyweight external binary. Opt in with --features ytdlp (and ship the binary).
+default = ["vnc", "flaresolverr"]
+vnc          = []
+flaresolverr = []
+ytdlp        = []
+# The fallback browser engine (DESIGN.md §3 "CDP client strategy"). Off by
+# default; the hand-rolled CDP client is the default engine from M2.
+chromiumoxide = ["dep:chromiumoxide"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "time", "sync", "net", "process", "io-util"] }
+axum = { version = "0.8", features = ["json", "tokio", "http1", "ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "limit", "catch-panic", "fs"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Tier-2 engine: browser TLS/HTTP2 impersonation (BoringSSL). Behind the
+# `FastClient` trait in fastpath.rs so it can be swapped for `impit` — DESIGN.md §14.1.
+wreq = { version = "0.16", features = ["socks", "gzip", "brotli", "deflate", "json", "stream"] }
+wreq-util = "0.2"
+
+url = "2"
+regex = "1"
+globset = "0.4"
+# Registrable-domain extraction against a compiled Public Suffix List.
+psl = "2"
+
+# Hand-rolled CDP client transport (DESIGN.md §3) — plaintext ws://127.0.0.1, no TLS.
+tokio-tungstenite = "0.23"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+base64 = "0.22"   # decode CDP getResponseBody payloads for the body sniff
+libc = "0.2"      # kill the Chromium process *group* on teardown (no orphans)
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+
+clap = { version = "4", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- fallback browser engine (feature = "chromiumoxide"), unused until/unless enabled ---
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+wiremock = "0.6"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

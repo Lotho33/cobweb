@@ -1,0 +1,80 @@
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to (re)build, e.g. v1.2.0"
+        required: true
+
+permissions:
+  contents: write   # create the GitHub Release
+  packages: write   # push to GHCR
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}   # ghcr.io/lotho33/cobweb
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          submodules: recursive
+
+      - name: Version from tag
+        id: v
+        run: |
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3      # arm64 leg is emulated
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ steps.v.outputs.version }}
+            type=raw,value=latest
+
+      # Multi-arch. NOTE: the linux/arm64 leg compiles BoringSSL under QEMU and
+      # is slow (~20-40 min). Move to native arm runners or a cross-compile once
+      # it's worth it.
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          body: |
+            Container image:
+
+            ```
+            docker pull ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+            ```
+
+            Also tagged `${{ env.IMAGE }}:latest`. Platforms: `linux/amd64`, `linux/arm64`.

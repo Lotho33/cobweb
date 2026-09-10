@@ -1,0 +1,24 @@
+{
+  "name": "cobweb",
+  "dockerComposeFile": "docker-compose.dev.yml",
+  "service": "dev",
+  "workspaceFolder": "/workspace/cobweb",
+  "shutdownAction": "stopCompose",
+  "forwardPorts": [8191],
+  "portsAttributes": {
+    "8191": { "label": "cobweb HTTP API" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"],
+      "settings": {
+        "[rust]": {
+          "editor.formatOnSave": true,
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        },
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  },
+  "postCreateCommand": "rustup component add clippy rustfmt >/dev/null 2>&1; cargo fetch"
+}

@@ -1,0 +1,32 @@
+# Dev config for the cobweb devcontainer.
+# Production/example knobs live in config.example.toml.
+
+[server]
+# Dev only: the devcontainer publishes 8191 and mycelium's dev stack dials
+# cobweb across the container network, so loopback-only won't do here.
+bind = "0.0.0.0"
+port = 8191
+browser_engine = "chromium"   # "none" = fast-path only
+max_contexts = 2
+idle_shutdown_secs = 300
+
+[browser]
+xvfb = true               # M2c: spawn Xvfb, run headed (falls back to headless if Xvfb missing)
+# no_sandbox auto-detects root; set true explicitly if needed
+
+[jar]
+path = "./data/jar"       # relative to the workspace folder; gitignored
+default_ttl_secs = 2700
+fail_streak = 3
+
+[egress.direct]
+proxy = ""
+
+# Uncomment once the VPN sidecars are wired into the dev compose (DESIGN §12
+# Phase 1). host.docker.internal reaches a proxy published on the host, the
+# same trick mycelium's dev compose uses for microwarp.
+# [egress.mullvad]
+# proxy = "socks5://host.docker.internal:1080"
+
+[log]
+level = "debug"

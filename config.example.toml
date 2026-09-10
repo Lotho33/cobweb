@@ -1,0 +1,67 @@
+# cobweb configuration — copy to config.toml and set COBWEB_CONFIG=/path/to/config.toml
+# See DESIGN.md for the full rationale behind each knob.
+
+[server]
+# Bind address. Defaults to 127.0.0.1: the API is unauthenticated and exposes an
+# SSRF-capable fetcher plus a browser-eval endpoint, so it must never face an
+# untrusted network directly. Use "0.0.0.0" (or "::") only behind a trusted
+# reverse proxy or on an internal container network.
+bind         = "127.0.0.1"
+port         = 8191
+# "chromium" = full pipeline. "none" = fast-path only, tiers 3-4 disabled,
+# process stays ~10 MB (for deployments whose sources have no bot protection).
+browser_engine = "chromium"
+max_contexts = 2          # concurrent browser contexts; requests beyond this queue
+idle_shutdown_secs = 900  # tear down Chromium after this long with no tier-3 traffic
+                          # (renderers are freed after every resolve regardless)
+# Tokio worker threads: env COBWEB_WORKER_THREADS (default 2). A sidecar rarely
+# needs more; raise it only if you drive many concurrent /v1/fetch streams.
+
+# ─── Browser tier (only used when browser_engine = "chromium") ────────────────
+[browser]
+chromium_path = "auto"    # "auto" searches PATH (chromium, chromium-browser, google-chrome)
+xvfb          = false     # false => --headless=new (lighter, no Xvfb). Set true ONLY if you
+                          # use the tier-4 manual VNC solve, which needs a real X display.
+no_sandbox    = false     # auto-forced true when cobweb runs as root (typical in containers)
+prewarm       = false     # true = launch Chromium at startup, never idle-shutdown (~500 MB resident, no cold start)
+nav_timeout_ms = 30000
+# extra_args = ["--disable-dev-shm-usage"]
+
+[jar]
+path             = "/data/jar"
+default_ttl_secs = 2700   # fallback cf_clearance lifetime when Set-Cookie gives no Max-Age
+fail_streak      = 3      # N consecutive 403s on a jar entry => mark it stale
+
+# ─── Egress profiles ─────────────────────────────────────────────────────────
+# Each request names one of these ("egress": "mullvad") or passes a raw
+# "proxy_url" (cobweb back-compat). A named egress that is configured but
+# unreachable FAILS the request — it never falls back to direct.
+
+[egress.direct]
+proxy = ""
+
+[egress.mullvad]
+proxy = "socks5://mullvad:1080"
+
+[egress.proton]
+proxy = "socks5://proton:1080"
+
+[egress.warp]
+proxy = "socks5://warp:1080"
+
+# ─── Optional: delegate hard challenges to an external FlareSolverr ───────────
+# Unset `endpoint` to disable tier 3b. When set, a challenge cobweb's own browser
+# can't pass is forwarded here; the returned cookies are merged into the jar and
+# ridden by the fast-path until they go stale.
+[flaresolverr]
+# endpoint         = "http://flaresolverr:8191"
+session_ttl_secs = 1800
+
+# ─── Optional: yt-dlp subprocess for signature-heavy hosts ───────────────────
+[ytdlp]
+enabled = false
+bin     = "yt-dlp"
+hosts   = ["youtube.com", "youtu.be", "vimeo.com", "dailymotion.com"]
+
+[log]
+level = "info"   # trace | debug | info | warn | error
