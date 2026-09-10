@@ -1,8 +1,9 @@
 //! M2b: the hand-rolled CDP client + a real Chromium.
 //!
-//! The Chromium-driven tests skip themselves when no browser is on PATH, so
-//! `cargo test` stays green on a bare box; CI / the devcontainer installs
-//! chromium and they run for real.
+//! The Chromium-driven tests skip themselves when no browser is on PATH (or
+//! when `COBWEB_SKIP_BROWSER_TESTS` is set), so `cargo test` stays green on a
+//! bare box and on hosted CI runners where a preinstalled headless Chrome
+//! can't bring up CDP. The devcontainer runs them for real.
 
 use std::time::Duration;
 
@@ -36,6 +37,12 @@ fn cdp_layer_never_enables_the_runtime_domain() {
 }
 
 fn have_chromium() -> bool {
+    // Hosted CI runners (GitHub `ubuntu-latest`) ship `google-chrome-stable` on
+    // PATH but its headless launch never brings CDP up in that sandbox. Let CI
+    // opt out explicitly rather than fight the runner.
+    if std::env::var_os("COBWEB_SKIP_BROWSER_TESTS").is_some() {
+        return false;
+    }
     std::env::var_os("PATH")
         .map(|paths| {
             std::env::split_paths(&paths).any(|dir| {

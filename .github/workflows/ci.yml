@@ -41,7 +41,12 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: test
+        # The runner ships google-chrome-stable but its headless launch can't
+        # bring CDP up in this sandbox — the browser/VNC integration tests
+        # self-skip on this flag. They run for real in the devcontainer.
         run: cargo test --all-features --no-fail-fast
+        env:
+          COBWEB_SKIP_BROWSER_TESTS: "1"
 
   # Licenses / advisories / bans / sources.
   deny:

@@ -19,6 +19,11 @@ use cobweb::jar::Jar;
 use cobweb::vnc::SessionManager;
 
 fn on_path(bin: &str) -> bool {
+    // Same CI opt-out as tests/cdp.rs: the full round-trip needs a working
+    // headed Chromium, which hosted runners can't provide.
+    if std::env::var_os("COBWEB_SKIP_BROWSER_TESTS").is_some() {
+        return false;
+    }
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
         .unwrap_or(false)
