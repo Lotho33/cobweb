@@ -13,9 +13,6 @@ permissions:
   contents: write   # create the GitHub Release
   packages: write   # push to GHCR
 
-env:
-  IMAGE: ghcr.io/${{ github.repository }}   # ghcr.io/lotho33/cobweb
-
 jobs:
   image:
     runs-on: ubuntu-latest
@@ -31,6 +28,15 @@ jobs:
           ref="${{ github.event.inputs.tag || github.ref_name }}"
           echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
 
+      # GHCR requires an all-lowercase repository path; github.repository
+      # preserves the account's actual casing ("Lotho33/cobweb"), which Docker
+      # rejects. metadata-action would normalise it for the tags it emits, but
+      # the release notes below also interpolate the image name verbatim in a
+      # `docker pull` line — compute the lowercase form once for every use.
+      - name: Lowercase image name
+        id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-qemu-action@v4      # arm64 leg is emulated
       - uses: docker/setup-buildx-action@v4
 
@@ -45,7 +51,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.IMAGE }}
+          images: ${{ steps.img.outputs.name }}
           tags: |
             type=raw,value=${{ steps.v.outputs.version }}
             type=raw,value=latest
@@ -74,7 +80,7 @@ jobs:
             Container image:
 
             ```
-            docker pull ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+            docker pull ${{ steps.img.outputs.name }}:${{ steps.v.outputs.version }}
             ```
 
-            Also tagged `${{ env.IMAGE }}:latest`. Platforms: `linux/amd64`, `linux/arm64`.
+            Also tagged `${{ steps.img.outputs.name }}:latest`. Platforms: `linux/amd64`, `linux/arm64`.
