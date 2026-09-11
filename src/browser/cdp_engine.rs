@@ -209,12 +209,16 @@ impl BrowserEngine for CdpEngine {
         // per-request egress (a named profile or a raw proxy_url — VPN sniffs,
         // manual VNC solves) is applied here on the browser context. Without
         // this the CDP tier silently egressed direct and `opts.egress` was
-        // carried but dropped. Loopback is bypassed so a localhost target
-        // isn't sent through the proxy.
+        // carried but dropped.
+        //
+        // No `proxyBypassList` / `<-loopback>` here on purpose: when a proxy is
+        // set, loopback and private targets must ride it too, not slip out
+        // direct (SSRF hardening — the entry-point `ssrf::guard_url` already
+        // rejects a private *target*; this stops a redirect/subresource from
+        // reaching one via the box's own network).
         let mut ctx_params = json!({ "disposeOnDetach": true });
         if let Some(proxy) = opts.egress.proxy.as_ref() {
             ctx_params["proxyServer"] = json!(proxy.as_str().trim_end_matches('/'));
-            ctx_params["proxyBypassList"] = json!("<-loopback>");
         }
         let bc = client
             .call("Target.createBrowserContext", ctx_params, None)

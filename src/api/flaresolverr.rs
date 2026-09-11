@@ -140,6 +140,15 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
     if let Err(e) = st.egress.ensure_available(&egress).await {
         return envelope("error", &e.to_string(), started, json!({}));
     }
+    if let Err(e) = crate::ssrf::guard_url(
+        &url,
+        egress.is_direct(),
+        st.config.server.allow_private_targets,
+    )
+    .await
+    {
+        return envelope("error", &e.to_string(), started, json!({}));
+    }
 
     let domain =
         registrable_domain(&url).unwrap_or_else(|_| url.host_str().unwrap_or("").to_string());

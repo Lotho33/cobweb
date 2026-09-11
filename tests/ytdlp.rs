@@ -31,6 +31,8 @@ async fn spawn(bin: &std::path::Path) -> (String, tempfile::TempDir) {
     let jar_dir = tempfile::tempdir().unwrap();
     let cfg = Config::parse(&format!(
         r#"
+        [server]
+        allow_private_targets = true
         [jar]
         path = {:?}
         [egress.direct]
@@ -46,7 +48,7 @@ async fn spawn(bin: &std::path::Path) -> (String, tempfile::TempDir) {
     .unwrap();
     let egress = EgressRegistry::from_config(&cfg).unwrap();
     let jar = Jar::new(jar_dir.path().to_path_buf(), Duration::from_secs(2700), 3);
-    let state = AppState::new(cfg, egress, jar, Arc::new(WreqClient::new()), None);
+    let state = AppState::new(cfg, egress, jar, Arc::new(WreqClient::new(true)), None);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

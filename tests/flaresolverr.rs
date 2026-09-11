@@ -37,7 +37,7 @@ impl App {
             None => String::new(),
         };
         let cfg = Config::parse(&format!(
-            "[server]\nport = 0\n[jar]\npath = {:?}\n[egress.direct]\nproxy = \"\"\n{fs_line}",
+            "[server]\nport = 0\nallow_private_targets = true\n[jar]\npath = {:?}\n[egress.direct]\nproxy = \"\"\n{fs_line}",
             jar_dir.path()
         ))
         .unwrap();
@@ -45,7 +45,7 @@ impl App {
         let egress = EgressRegistry::from_config(&cfg).unwrap();
         let jar = Jar::new(jar_dir.path().to_path_buf(), Duration::from_secs(2700), 3);
         let browser = engine.map(|e| Arc::new(e) as Arc<dyn BrowserEngine>);
-        let state = AppState::new(cfg, egress, jar, Arc::new(WreqClient::new()), browser);
+        let state = AppState::new(cfg, egress, jar, Arc::new(WreqClient::new(true)), browser);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

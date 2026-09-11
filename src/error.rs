@@ -42,6 +42,11 @@ pub enum CobwebError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// Target URL is refused by the SSRF guard (resolves to a private / loopback
+    /// / link-local / metadata address). See `[server].allow_private_targets`.
+    #[error("blocked target: {0}")]
+    Blocked(String),
+
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -72,6 +77,7 @@ impl CobwebError {
             CobwebError::NeedsManualSolve { .. } => "needs_manual_solve",
             CobwebError::NotResolved(_) => "not_resolved",
             CobwebError::BadRequest(_) => "bad_request",
+            CobwebError::Blocked(_) => "blocked",
             CobwebError::Conflict(_) => "conflict",
             CobwebError::Upstream(_) => "upstream",
             CobwebError::Browser(_) => "browser",
@@ -84,6 +90,7 @@ impl CobwebError {
     fn status(&self) -> StatusCode {
         match self {
             CobwebError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            CobwebError::Blocked(_) => StatusCode::FORBIDDEN,
             CobwebError::Conflict(_) => StatusCode::CONFLICT,
             CobwebError::UnknownEgress(_) => StatusCode::BAD_REQUEST,
             CobwebError::EgressUnavailable { .. } => StatusCode::BAD_GATEWAY,

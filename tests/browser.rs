@@ -31,7 +31,7 @@ impl App {
         let upstream = MockServer::start().await;
         let jar_dir = tempfile::tempdir().unwrap();
         let cfg = Config::parse(&format!(
-            "[server]\nport = 0\n[jar]\npath = {:?}\n[egress.direct]\nproxy = \"\"\n",
+            "[server]\nport = 0\nallow_private_targets = true\n[jar]\npath = {:?}\n[egress.direct]\nproxy = \"\"\n",
             jar_dir.path()
         ))
         .unwrap();
@@ -42,7 +42,7 @@ impl App {
             cfg,
             egress,
             jar,
-            Arc::new(WreqClient::new()),
+            Arc::new(WreqClient::new(true)),
             Some(engine.clone() as Arc<dyn BrowserEngine>),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

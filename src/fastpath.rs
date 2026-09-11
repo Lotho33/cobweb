@@ -76,6 +76,8 @@ pub trait FastClient: Send + Sync {
 /// reusing across requests.
 pub struct WreqClient {
     cache: Mutex<HashMap<String, wreq::Client>>,
+    /// Passed to the per-client [`crate::ssrf::GuardedResolver`].
+    allow_private_targets: bool,
 }
 
 /// How a cached `wreq::Client` should be tuned.
@@ -88,16 +90,11 @@ enum ClientKind {
     Stream,
 }
 
-impl Default for WreqClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WreqClient {
-    pub fn new() -> Self {
+    pub fn new(allow_private_targets: bool) -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
+            allow_private_targets,
         }
     }
 
@@ -129,6 +126,10 @@ impl WreqClient {
 
         let mut builder = wreq::Client::builder()
             .emulation(Self::emulation_for(fingerprint))
+            // SSRF guard: resolve + vet every address, re-run on each redirect.
+            .dns_resolver(crate::ssrf::GuardedResolver::new(
+                self.allow_private_targets,
+            ))
             // Keep sockets to the same origin warm across the repeated calls a
             // single resolve makes (player HTML, then the manifest probe).
             .pool_idle_timeout(Duration::from_secs(90))

@@ -14,6 +14,13 @@ browser_engine = "chromium"
 max_contexts = 2          # concurrent browser contexts; requests beyond this queue
 idle_shutdown_secs = 900  # tear down Chromium after this long with no tier-3 traffic
                           # (renderers are freed after every resolve regardless)
+# SSRF guard. false (default): every fetcher resolves the target first and
+# refuses any private / loopback / link-local / CGNAT / ULA address, re-checked
+# after each redirect. Set true ONLY if cobweb is meant to reach hosts on your
+# own private network (e.g. a LAN media server) — containment is then your
+# firewall's job. 169.254.169.254 and a few always-bogus ranges stay blocked
+# either way.
+allow_private_targets = false
 # Tokio worker threads: env COBWEB_WORKER_THREADS (default 2). A sidecar rarely
 # needs more; raise it only if you drive many concurrent /v1/fetch streams.
 

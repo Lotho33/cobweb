@@ -346,6 +346,37 @@ Internally every `request.*` runs tier 3 (browser) — that's what FlareSolverr
 clients expect. `sessions.*` map onto jar entries keyed by the FlareSolverr
 session name instead of `(domain, egress)`.
 
+### 6.3 Request safety — SSRF guard (`src/ssrf.rs`)
+
+The API takes a caller-supplied URL and fetches it. `ssrf::guard_url` runs at
+every entry point (`/v1/resolve`, `/v1/navigate`, `/v1/fetch`, `/v1/sniff`,
+`/v1/eval`, inbound `/v1`, `/v1/session/start`) before anything connects:
+
+- **scheme** must be `http`/`https`;
+- a **literal** non-global IP or `localhost` in the URL is refused on any egress;
+- on the **direct** egress the host is resolved and refused if *any* A/AAAA is
+  non-global (rebinding lure). A proxied egress resolves at the proxy — the
+  operator owns that exit — so only the literal check applies there.
+
+On the fast path the same predicate is the `wreq` DNS resolver
+(`ssrf::GuardedResolver`), so it re-runs on every redirect hop and pins the
+connection to the vetted address (no TOCTOU re-resolve).
+
+Two tiers of "bad": **hard-blocked** (`0.0.0.0/8`, `169.254.169.254`, multicast,
+broadcast, documentation, benchmarking, reserved) is always refused;
+**private** (loopback, RFC1918, rest of link-local, CGNAT `100.64/10`, IPv6 ULA
+`fc00::/7`, `fe80::/10`) is refused unless `[server].allow_private_targets =
+true` — the escape hatch for an operator who deliberately points cobweb at a LAN
+media server.
+
+The CDP browser context sets **no** `proxyBypassList`: when an egress proxy is
+configured, loopback/private targets ride it too instead of leaking out direct.
+
+**Residual (M-follow-up):** subresource / JS-initiated fetches *inside* Chromium
+(notably `/v1/eval`) are not individually re-checked against resolved IPs —
+full coverage needs `Fetch`-domain interception with an async allowlist. The
+caller-supplied navigation URL and top-level redirects are covered.
+
 ---
 
 ## 7. Crate layout

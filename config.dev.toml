@@ -9,6 +9,9 @@ port = 8191
 browser_engine = "chromium"   # "none" = fast-path only
 max_contexts = 2
 idle_shutdown_secs = 300
+# Dev convenience: lets the devcontainer point cobweb at sibling containers /
+# host.docker.internal for end-to-end testing. Never set this in production.
+allow_private_targets = true
 
 [browser]
 xvfb = true               # M2c: spawn Xvfb, run headed (falls back to headless if Xvfb missing)
