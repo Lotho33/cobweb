@@ -22,6 +22,17 @@ struct TestApp {
 
 impl TestApp {
     async fn spawn() -> Self {
+        Self::spawn_inner(true).await
+    }
+
+    /// Like [`spawn`], but with the SSRF guard live (`allow_private_targets =
+    /// false`), so the mock upstream on loopback is *not* reachable — used only
+    /// by the guard tests.
+    async fn spawn_guarded() -> Self {
+        Self::spawn_inner(false).await
+    }
+
+    async fn spawn_inner(allow_private_targets: bool) -> Self {
         let upstream = MockServer::start().await;
         let jar_dir = tempfile::tempdir().unwrap();
         let cfg = Config::parse(&format!(
@@ -29,6 +40,7 @@ impl TestApp {
             [server]
             port = 0
             browser_engine = "none"
+            allow_private_targets = {allow_private_targets}
             [jar]
             path = {:?}
             default_ttl_secs = 2700
@@ -489,4 +501,50 @@ async fn fetch_rejects_unknown_named_egress() {
         )
         .await;
     assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn ssrf_guard_blocks_loopback_and_metadata_targets() {
+    // Guard live: the loopback mock upstream is off-limits …
+    let app = TestApp::spawn_guarded().await;
+
+    for path in ["/v1/resolve", "/v1/navigate"] {
+        let (status, body) = app
+            .post(path, json!({ "url": format!("{}/x", app.upstream.uri()) }))
+            .await;
+        assert_eq!(status, 403, "{path} body: {body}");
+        assert_eq!(body["kind"], json!("blocked"), "{path}");
+    }
+
+    // … and the cloud-metadata address is refused regardless of egress.
+    let (status, body) = app
+        .post(
+            "/v1/resolve",
+            json!({ "url": "http://169.254.169.254/latest/meta-data/" }),
+        )
+        .await;
+    assert_eq!(status, 403, "body: {body}");
+    assert_eq!(body["kind"], json!("blocked"));
+
+    // /v1/fetch too.
+    let (status, _h, _b) = app
+        .post_raw(
+            "/v1/fetch",
+            json!({ "url": format!("{}/x", app.upstream.uri()) }),
+        )
+        .await;
+    assert_eq!(status, 403);
+}
+
+#[tokio::test]
+async fn ssrf_guard_off_allows_private_targets() {
+    // The default test harness runs with allow_private_targets = true, so a
+    // loopback upstream resolves fine (covered by the other tests). This just
+    // pins that the metadata IP is the one thing still blocked.
+    let app = TestApp::spawn().await;
+    let (status, body) = app
+        .post("/v1/navigate", json!({ "url": "http://169.254.169.254/" }))
+        .await;
+    assert_eq!(status, 403, "body: {body}");
+    assert_eq!(body["kind"], json!("blocked"));
 }

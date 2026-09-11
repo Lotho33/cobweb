@@ -407,6 +407,8 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
     state.egress.ensure_available(&egress).await?;
 
     // yt-dlp path: for configured hosts, shell out instead of running the tiers.
+    // Runs before the SSRF guard — `[ytdlp].hosts` is an explicit operator
+    // allowlist and yt-dlp does its own fetching.
     #[cfg(feature = "ytdlp")]
     if let Some(yt) = &state.ytdlp {
         if yt.handles(&params.url) {
@@ -436,6 +438,13 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
             });
         }
     }
+
+    crate::ssrf::guard_url(
+        &params.url,
+        egress.is_direct(),
+        state.config.server.allow_private_targets,
+    )
+    .await?;
 
     let jar_entry = state.jar.get_fresh(&domain, &egress).await;
     let globset = globset_for(&params.url_pattern)?;
@@ -690,6 +699,12 @@ pub async fn navigate_fastpath(
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
     state.egress.ensure_available(&egress).await?;
+    crate::ssrf::guard_url(
+        &url,
+        egress.is_direct(),
+        state.config.server.allow_private_targets,
+    )
+    .await?;
     let jar = state.jar.get_fresh(&domain, &egress).await;
 
     let now = chrono::Utc::now().timestamp() as f64;
@@ -782,6 +797,12 @@ pub async fn browser_sniff(
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
     state.egress.ensure_available(&egress).await?;
+    crate::ssrf::guard_url(
+        &trigger,
+        egress.is_direct(),
+        state.config.server.allow_private_targets,
+    )
+    .await?;
     let jar_entry = state.jar.get_fresh(&domain, &egress).await;
     let globset = globset_for(&url_pattern)?;
 
@@ -838,6 +859,12 @@ pub async fn browser_eval(
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
     state.egress.ensure_available(&egress).await?;
+    crate::ssrf::guard_url(
+        &url,
+        egress.is_direct(),
+        state.config.server.allow_private_targets,
+    )
+    .await?;
     let jar_entry = state.jar.get_fresh(&domain, &egress).await;
 
     let opts = ContextOptions {

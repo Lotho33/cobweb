@@ -14,6 +14,7 @@ pub mod flaresolverr_client;
 pub mod jar;
 pub mod metrics;
 pub mod pipeline;
+pub mod ssrf;
 pub mod state;
 #[cfg(feature = "vnc")]
 pub mod vnc;

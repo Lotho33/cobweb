@@ -64,6 +64,7 @@ impl AppState {
                 b,
                 jar.clone(),
                 egress.clone(),
+                config.server.allow_private_targets,
             ))
         });
 
@@ -130,13 +131,8 @@ impl AppState {
             }
         };
 
-        Ok(Self::new(
-            config,
-            egress,
-            jar,
-            Arc::new(WreqClient::new()),
-            browser,
-        ))
+        let fast = Arc::new(WreqClient::new(config.server.allow_private_targets));
+        Ok(Self::new(config, egress, jar, fast, browser))
     }
 
     pub fn uptime(&self) -> Duration {

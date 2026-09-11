@@ -42,7 +42,7 @@ fn manager(engine: Arc<dyn BrowserEngine>) -> (TempDir, SessionManager) {
         3,
     ));
     let egress = Arc::new(EgressRegistry::from_config(&cfg).unwrap());
-    (dir, SessionManager::new(engine, jar, egress))
+    (dir, SessionManager::new(engine, jar, egress, true))
 }
 
 #[tokio::test]

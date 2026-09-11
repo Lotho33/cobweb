@@ -41,6 +41,7 @@ pub struct SessionManager {
     engine: Arc<dyn BrowserEngine>,
     jar: SharedJar,
     egress: Arc<EgressRegistry>,
+    allow_private_targets: bool,
     inner: Mutex<Option<ActiveSession>>,
 }
 
@@ -49,11 +50,13 @@ impl SessionManager {
         engine: Arc<dyn BrowserEngine>,
         jar: SharedJar,
         egress: Arc<EgressRegistry>,
+        allow_private_targets: bool,
     ) -> Self {
         Self {
             engine,
             jar,
             egress,
+            allow_private_targets,
             inner: Mutex::new(None),
         }
     }
@@ -96,6 +99,7 @@ impl SessionManager {
 
         let egress = self.egress.resolve(egress_name, proxy_url)?;
         self.egress.ensure_available(&egress).await?;
+        crate::ssrf::guard_url(&url, egress.is_direct(), self.allow_private_targets).await?;
 
         // Load the jar entry even if stale — the admin is here to re-solve it.
         let seed = self.jar.load(&domain, &egress).await;

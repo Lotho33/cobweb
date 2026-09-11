@@ -54,6 +54,15 @@ pub struct ServerConfig {
     pub max_contexts: usize,
     #[serde(default = "default_idle_shutdown_secs")]
     pub idle_shutdown_secs: u64,
+    /// SSRF guard relaxation. When `false` (the default) every fetcher resolves
+    /// the target host first and refuses any address that is private / loopback
+    /// / link-local / CGNAT / ULA, re-checked after each redirect. Set `true`
+    /// only when cobweb is *meant* to reach hosts on your own private network
+    /// (e.g. a LAN media server) — containment is then your firewall's job.
+    /// The cloud metadata address and a few always-bogus ranges stay blocked
+    /// either way.
+    #[serde(default)]
+    pub allow_private_targets: bool,
 }
 
 impl Default for ServerConfig {
@@ -64,6 +73,7 @@ impl Default for ServerConfig {
             browser_engine: BrowserEngine::default(),
             max_contexts: default_max_contexts(),
             idle_shutdown_secs: default_idle_shutdown_secs(),
+            allow_private_targets: false,
         }
     }
 }
