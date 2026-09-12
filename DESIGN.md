@@ -177,9 +177,11 @@ client** (`browser/cdp.rs`, ~400–600 LOC over `tokio-tungstenite`:
 request/response by `id`, events by `method`) covering the ~10 methods the sniff
 needs, plus `Page.createIsolatedWorld` eval for `/v1/eval` and `/v1/navigate`.
 It is the *smaller* dependency, keeps the hot path fully under our control, and
-fits the "the sniff is a stable surface" maintenance thesis. `chromiumoxide` is
-kept behind the `BrowserEngine` trait (§8) as a fallback if the hand-rolled layer
-proves insufficient — it is not a runtime dependency of the default build.
+fits the "the sniff is a stable surface" maintenance thesis. `chromiumoxide` was
+evaluated as a fallback behind the `BrowserEngine` trait (§8) in case the
+hand-rolled layer proved insufficient; it never did, no adapter was written, and
+the `chromiumoxide` cargo feature/dependency has since been removed. The trait
+remains the seam a future fallback engine would slot into.
 
 > **Not an option: _patchright_.** It is a fork of the Playwright **library**
 > (Python/Node/.NET) that applies these patches client-side; it is not a patched
@@ -406,8 +408,8 @@ cobweb/
     │   ├── mod.rs            ← BrowserPool, lazy launch, idle shutdown
     │   ├── engine.rs         ← BrowserEngine / BrowserContext traits (the swap seam, §3/§8)
     │   ├── cdp.rs            ← hand-rolled CDP client over tokio-tungstenite;
-    │   │                        no Runtime.enable; isolated-world eval — DEFAULT engine
-    │   ├── chromiumoxide.rs  ← #[cfg(feature = "chromiumoxide")] adapter — FALLBACK engine only
+    │   │                        no Runtime.enable; isolated-world eval — the ONLY engine
+    │   │                        (a chromiumoxide fallback was evaluated, never built; see §3)
     │   ├── context.rs        ← ContextGuard (Drop = save storage_state + close)
     │   ├── sniff.rs          ← Fetch/Network interception, url_pattern match
     │   └── stealth.rs        ← webdriver/UA patches (addScriptToEvaluateOnNewDocument), resource blocking
@@ -429,7 +431,6 @@ cobweb/
 | `axum` + `tower-http` | HTTP server, middleware (auth passthrough, tracing, limits) |
 | `wreq` + `wreq-util` | HTTP client with **browser TLS/HTTP2 impersonation**; the tier-2 engine, behind the `FastClient` trait. Maintained successor of `rquest` / `reqwest-impersonate` (v0.16 / v0.2 as of 2026-08). TLS backend is `btls` (BoringSSL) built from source → **build needs `cmake` + `clang`**. `impit` (Apify) is the named fallback. |
 | `tokio-tungstenite` | transport for the hand-rolled **CDP client** (§3) *and* the VNC websocket bridge |
-| `chromiumoxide` | *optional (`chromiumoxide` feature), fallback only.* Full CDP crate; sends `Runtime.enable` per frame (detection vector, §3) so it is not the default engine. |
 | `serde` / `serde_json` / `toml` | config + DTOs + jar files |
 | `url` | egress + target URL parsing |
 | `tracing` / `tracing-subscriber` | structured logs |
@@ -445,7 +446,6 @@ default = ["vnc", "flaresolverr"]
 vnc           = []   # Xvfb/x11vnc/noVNC. Off → image is ~150 MB smaller, tier 4 gone.
 flaresolverr  = []   # outbound delegate tier 3b + inbound /v1 API
 ytdlp         = []   # yt-dlp subprocess path — NOT default (heavy, fast-moving binary)
-chromiumoxide = ["dep:chromiumoxide"]  # build the fallback BrowserEngine adapter; off by default
 ```
 
 `--no-default-features` → a pure fast-path + headless-sniff extractor, no
@@ -500,8 +500,9 @@ impl Jar {
 ```
 
 ```rust
-// browser/engine.rs — the swap seam (§3). Default impl = browser/cdp.rs (hand-rolled,
-// no Runtime.enable). Fallback impl = chromiumoxide adapter, behind its cargo feature.
+// browser/engine.rs — the swap seam (§3). Only impl = browser/cdp.rs (hand-rolled,
+// no Runtime.enable). A chromiumoxide-backed fallback was evaluated (§3) but never
+// built; this trait is the seam a future one would slot into.
 #[async_trait]
 pub trait BrowserEngine: Send + Sync {
     async fn launch(&self, cfg: &BrowserCfg) -> Result<()>;      // lazy; spawns Xvfb + Chromium
@@ -700,9 +701,12 @@ What makes this *not* a weekly treadmill:
 - **CDP detection via `Runtime.enable` — RESOLVED.** Confirmed by source:
   chromiumoxide's `FrameManager::init_commands()` sends `Runtime.enable` per
   frame, no opt-out. Decision: ship a hand-rolled CDP client (`browser/cdp.rs`)
-  for tier 3 + `Page.createIsolatedWorld` eval; keep `chromiumoxide` behind the
-  `BrowserEngine` trait as a feature-gated fallback only. See §3 "CDP client
-  strategy". *patchright* is a Playwright fork, not a Chromium build — not
+  for tier 3 + `Page.createIsolatedWorld` eval instead. A chromiumoxide-backed
+  fallback behind the `BrowserEngine` trait was considered but never built (the
+  hand-rolled client never proved insufficient) — the `chromiumoxide` cargo
+  feature/dependency has since been removed; the trait remains the seam a
+  future fallback would use. See §3 "CDP client strategy". *patchright* is a
+  Playwright fork, not a Chromium build — not
   applicable to Rust.
 - **Xvfb: always-warm vs lazy — RESOLVED: lazy.** Xvfb and Chromium share one
   lifetime: spawn together on the first tier-3 request, tear down together on one

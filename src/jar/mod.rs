@@ -36,9 +36,6 @@ pub struct JarEntry {
     pub user_agent: String,
     #[serde(default)]
     pub accept_language: String,
-    /// Which impersonation profile produced this entry (e.g. `chrome-147-linux`).
-    #[serde(default)]
-    pub fingerprint_id: String,
     pub created: DateTime<Utc>,
     #[serde(default)]
     pub last_ok: Option<DateTime<Utc>>,
@@ -63,7 +60,6 @@ impl JarEntry {
             storage_state: StorageState::default(),
             user_agent: String::new(),
             accept_language: String::new(),
-            fingerprint_id: String::new(),
             created: Utc::now(),
             last_ok: None,
             ttl_hint_secs,
@@ -168,9 +164,33 @@ impl Jar {
         let tmp = path.with_extension("json.tmp");
         let json = serde_json::to_vec_pretty(entry)
             .map_err(|e| CobwebError::Other(anyhow::anyhow!("serialise jar entry: {e}")))?;
-        tokio::fs::write(&tmp, &json).await?;
+        tokio::fs::write(&tmp, &json).await.map_err(|e| {
+            CobwebError::Other(anyhow::anyhow!(
+                "jar write {}/{}: {e}",
+                entry.domain,
+                entry.egress
+            ))
+        })?;
+        // The jar holds live session cookies (cf_clearance and friends) in
+        // plaintext; restrict the file to the owner so another local
+        // user/process sharing the host or a volume can't read them off disk.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await
+            {
+                tracing::warn!(path = %tmp.display(), error = %e, "jar: could not restrict file permissions");
+            }
+        }
         // Atomic replace so a concurrent reader never sees a half-written file.
-        tokio::fs::rename(&tmp, &path).await?;
+        tokio::fs::rename(&tmp, &path).await.map_err(|e| {
+            CobwebError::Other(anyhow::anyhow!(
+                "jar rename {}/{}: {e}",
+                entry.domain,
+                entry.egress
+            ))
+        })?;
         Ok(())
     }
 
@@ -204,9 +224,31 @@ impl Jar {
     }
 
     /// Record a successful use: reset the streak, stamp `last_ok`, and persist
-    /// the (possibly updated) storage state / fingerprint.
+    /// the (possibly updated) storage state.
+    ///
+    /// `entry` is normally built from a jar "seed" the caller read *before*
+    /// running a tier — which can take seconds (a browser sniff, an external
+    /// FlareSolverr delegate). Two concurrent resolves for the same
+    /// `(domain, egress)` (a popular stream requested by more than one client
+    /// at once) can therefore each start from the same seed and race to write
+    /// back: naively trusting `entry` as ground truth would let whichever call
+    /// finishes second silently overwrite the cookies the first one just
+    /// persisted. Re-reading the freshest on-disk entry under the write lock
+    /// and merging the caller's cookies on top of *that* (instead of the
+    /// caller's own, possibly stale, snapshot) closes that lost-update window.
     pub async fn note_success(&self, mut entry: JarEntry) -> Result<()> {
         let _g = self.write_lock.lock().await;
+        let incoming_cookies = std::mem::take(&mut entry.storage_state.cookies);
+        if let Some(current) = self.load_by_key(&entry.domain, &entry.egress).await {
+            entry.storage_state = current.storage_state;
+            if entry.user_agent.is_empty() {
+                entry.user_agent = current.user_agent;
+            }
+            if entry.accept_language.is_empty() {
+                entry.accept_language = current.accept_language;
+            }
+        }
+        entry.storage_state.merge_from(incoming_cookies);
         entry.fail_streak = 0;
         entry.last_ok = Some(Utc::now());
         if entry.schema_version == 0 {
@@ -390,8 +432,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn note_success_does_not_lose_a_concurrent_writers_cookie() {
+        // Simulates two resolves for the same (domain, egress) that both read
+        // the same seed before their tier ran, then finish out of order: A's
+        // `note_success` must not be clobbered by B's, even though B's
+        // in-memory `entry` was built from a snapshot that predates A's write.
+        let (_d, jar) = tmp_jar();
+        let seed = JarEntry::new("race.to", "direct", 2700);
+        jar.save(&seed).await.unwrap();
+
+        let mut a = seed.clone();
+        a.storage_state = StorageState::from_cookies(vec![Cookie::new("a", "1", "race.to")]);
+        jar.note_success(a).await.unwrap();
+
+        // b was built from the *original* seed (no cookie "a"), as if its tier
+        // had started before a's finished.
+        let mut b = seed.clone();
+        b.storage_state = StorageState::from_cookies(vec![Cookie::new("b", "2", "race.to")]);
+        jar.note_success(b).await.unwrap();
+
+        let after = jar.load("race.to", &Egress::direct()).await.unwrap();
+        let names: Vec<&str> = after
+            .storage_state
+            .cookies
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"a"),
+            "lost cookie `a` to a concurrent write"
+        );
+        assert!(names.contains(&"b"));
+    }
+
+    #[tokio::test]
     async fn missing_entry_loads_as_none() {
         let (_d, jar) = tmp_jar();
         assert!(jar.load("nope.to", &mullvad()).await.is_none());
+    }
+
+    // `sanitize()` is the only barrier against a hostile `domain` / egress-key
+    // (a FlareSolverr `session` name is caller-chosen, see api/flaresolverr.rs)
+    // escaping the jar directory via `../` or an absolute path. It had zero
+    // dedicated tests despite being security-relevant.
+    #[test]
+    fn sanitize_neutralises_path_traversal_and_separators() {
+        // `.` is in the keep-set (ordinary domains contain it), so only the
+        // `/` separators are neutralised — `..` survives as text, it just
+        // can no longer act as a path component on its own (see
+        // `hostile_domain_cannot_escape_the_jar_directory` below for why that
+        // still can't escape the jar root).
+        assert_eq!(sanitize("../../etc/passwd"), "..-..-etc-passwd");
+        assert_eq!(sanitize("/etc/passwd"), "-etc-passwd");
+        assert_eq!(sanitize("a/b\\c"), "a-b-c");
+        assert_eq!(sanitize(".."), "..");
+        assert_eq!(sanitize(""), "");
+        // Ordinary registrable domains / egress keys pass through unchanged.
+        assert_eq!(sanitize("example.com"), "example.com");
+        assert_eq!(sanitize("proxy-10.0.0.1-1080"), "proxy-10.0.0.1-1080");
+    }
+
+    #[tokio::test]
+    async fn hostile_domain_cannot_escape_the_jar_directory() {
+        let (dir, jar) = tmp_jar();
+        let evil = JarEntry::new("../../../../tmp/pwned", "direct", 2700);
+        jar.save(&evil).await.unwrap();
+        // The written file must land *inside* the jar root, not at the
+        // traversed path.
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        let mut found_inside = false;
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            if e.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                found_inside = true;
+            }
+        }
+        assert!(found_inside, "jar file was not written inside the jar root");
+        assert!(!PathBuf::from("/tmp/pwned").exists());
     }
 }

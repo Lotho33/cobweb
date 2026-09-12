@@ -63,6 +63,14 @@ pub struct ServerConfig {
     /// either way.
     #[serde(default)]
     pub allow_private_targets: bool,
+    /// Shared secret required on every request (`Authorization: Bearer <key>`
+    /// or `X-Api-Key: <key>`) except `GET /health`, the vendored noVNC static
+    /// assets, and the VNC websocket upgrade (which carries its own
+    /// per-session token — see `[server].allow_private_targets` neighbour
+    /// `vnc::session`). Unset => the API is unauthenticated; `main.rs` warns
+    /// loudly at startup if that's combined with a non-loopback bind.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -74,11 +82,22 @@ impl Default for ServerConfig {
             max_contexts: default_max_contexts(),
             idle_shutdown_secs: default_idle_shutdown_secs(),
             allow_private_targets: false,
+            api_key: None,
         }
     }
 }
 
 impl ServerConfig {
+    /// The configured API key, or `None` if unset/blank (so `api_key = ""` in
+    /// a config file behaves the same as omitting the key entirely, instead of
+    /// silently requiring callers to send an empty header value).
+    pub fn effective_api_key(&self) -> Option<&str> {
+        self.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+    }
+
     pub fn listen_addr(&self) -> SocketAddr {
         // `validate()` already rejected an unparseable bind; fall back to
         // loopback rather than the old 0.0.0.0 if something slips through.

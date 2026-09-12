@@ -82,13 +82,17 @@ async fn run() -> ExitCode {
     }
 
     let addr = cfg.server.listen_addr();
-    if !addr.ip().is_loopback() {
+    let has_api_key = cfg.server.effective_api_key().is_some();
+    if !addr.ip().is_loopback() && !has_api_key {
         tracing::warn!(
             %addr,
-            "binding a non-loopback address: the API is UNAUTHENTICATED and can run \
-             arbitrary JS in a browser / fetch arbitrary URLs. Only do this behind a \
+            "binding a non-loopback address with NO [server].api_key configured: the API \
+             is UNAUTHENTICATED and can run arbitrary JS in a browser / fetch arbitrary \
+             URLs / read the cookie jar. Set [server].api_key, or only do this behind a \
              trusted reverse proxy or a private container network."
         );
+    } else if !addr.ip().is_loopback() {
+        tracing::info!(%addr, "binding a non-loopback address; [server].api_key is set");
     }
     let state = match AppState::from_config(cfg) {
         Ok(s) => s,

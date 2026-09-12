@@ -72,7 +72,7 @@ impl MockEngine {
     }
 
     fn next_script(&self) -> SniffScript {
-        let mut q = self.scripts.lock().unwrap();
+        let mut q = self.scripts.lock().unwrap_or_else(|e| e.into_inner());
         if q.len() > 1 {
             q.remove(0)
         } else {

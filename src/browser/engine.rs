@@ -1,9 +1,11 @@
 //! The browser engine seam (DESIGN.md §3 "CDP client strategy", §8).
 //!
-//! `resolve()` and `/v1/sniff` depend only on these traits. The default impl is
-//! the hand-rolled CDP client (`browser/cdp.rs`, M2b) which **never sends
-//! `Runtime.enable`**; `MockEngine` backs the tests; `chromiumoxide` can slot in
-//! behind the same traits as a fallback.
+//! `resolve()` and `/v1/sniff` depend only on these traits. The default (and
+//! only shipping) impl is the hand-rolled CDP client (`browser/cdp.rs`, M2b)
+//! which **never sends `Runtime.enable`**; `MockEngine` backs the tests. A
+//! `chromiumoxide`-backed fallback was evaluated during design (DESIGN.md §3)
+//! but never implemented — this trait is the seam a future one would slot
+//! into, not a promise that one already exists.
 
 use std::time::Duration;
 
@@ -48,22 +50,6 @@ pub enum WaitFor {
     NetworkIdle,
     /// A CSS selector appears in the DOM.
     Selector(String),
-}
-
-impl WaitFor {
-    /// Parse the cobweb `wait_for` field: empty/none => Load, `"networkidle"`,
-    /// `"domcontentloaded"`, otherwise treated as a CSS selector.
-    pub fn parse(s: Option<&str>) -> Self {
-        match s.map(str::trim).filter(|s| !s.is_empty()) {
-            None => WaitFor::Load,
-            Some("load") => WaitFor::Load,
-            Some("domcontentloaded") | Some("domcontent") => WaitFor::DomContentLoaded,
-            Some("networkidle") | Some("networkidle0") | Some("networkidle2") => {
-                WaitFor::NetworkIdle
-            }
-            Some(sel) => WaitFor::Selector(sel.to_string()),
-        }
-    }
 }
 
 /// What a context is seeded with on acquire.

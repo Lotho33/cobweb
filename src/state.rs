@@ -127,6 +127,7 @@ impl AppState {
                     config.browser.clone(),
                     config.server.max_contexts,
                     idle,
+                    config.server.allow_private_targets,
                 )))
             }
         };

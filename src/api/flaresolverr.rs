@@ -137,6 +137,10 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
         Ok(e) => e,
         Err(e) => return envelope("error", &e.to_string(), started, json!({})),
     };
+    if let Err(e) = crate::ssrf::guard_egress(&egress, st.config.server.allow_private_targets).await
+    {
+        return envelope("error", &e.to_string(), started, json!({}));
+    }
     if let Err(e) = st.egress.ensure_available(&egress).await {
         return envelope("error", &e.to_string(), started, json!({}));
     }
@@ -225,7 +229,12 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
 async fn sessions_create(st: &AppState, req: V1Request, started: u128) -> Value {
     use crate::jar::JarEntry;
     let name = req.session.unwrap_or_else(|| format!("fs{}", now_ms()));
-    let ttl = st.jar.default_ttl().as_secs();
+    // `[flaresolverr].session_ttl_secs` — parsed since M1 but never actually
+    // consulted; every FlareSolverr-session jar entry silently used the
+    // generic `[jar].default_ttl_secs` instead, so an operator setting the
+    // two differently (DESIGN.md documents them as separate knobs) saw no
+    // effect from this one.
+    let ttl = st.config.flaresolverr.session_ttl_secs;
     let entry = JarEntry::new(name.clone(), FS_KEY.to_string(), ttl);
     if let Err(e) = st.jar.save(&entry).await {
         return envelope("error", &format!("create session: {e}"), started, json!({}));

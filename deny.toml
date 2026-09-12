@@ -4,15 +4,13 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    # async-std is discontinued. It reaches the graph ONLY through
-    # `chromiumoxide` (async-tungstenite 0.27), which is the off-by-default
-    # `chromiumoxide` feature — a legacy fallback browser engine that shipped
-    # images never enable (the hand-rolled CDP client is the default from M2,
-    # see DESIGN.md §3). No fix is available upstream until chromiumoxide drops
-    # async-std. Re-check when the `chromiumoxide` feature is removed.
-    "RUSTSEC-2025-0052",
-]
+# RUSTSEC-2025-0052 (async-std discontinued) previously required an ignore
+# here — it only ever reached the graph through the `chromiumoxide` feature
+# (a fallback browser engine that was evaluated during design, DESIGN.md §3,
+# but never implemented and has since been removed along with the feature
+# flag and its dependency). No ignores needed now; re-add one if a future
+# dependency ever pulls async-std back in.
+ignore = []
 
 [licenses]
 version = 2
@@ -37,9 +35,6 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# chromiumoxide is an optional, off-by-default fallback engine — its dep subtree
-# is allowed to bring duplicates it needs.
-skip-tree = [{ name = "chromiumoxide" }]
 
 [sources]
 unknown-registry = "deny"

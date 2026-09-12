@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 use super::engine::{BrowserError, BrowserResult};
@@ -128,29 +127,28 @@ impl Chromium {
 
         // Drain stderr into a bounded buffer so a launch failure can say why.
         let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        if let Some(mut err) = child.stderr.take() {
-            let tail = stderr_tail.clone();
-            tokio::spawn(async move {
-                let mut chunk = [0u8; 4096];
-                while let Ok(n) = err.read(&mut chunk).await {
-                    if n == 0 {
-                        break;
-                    }
-                    let mut g = tail.lock().unwrap();
-                    g.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                    if g.len() > 8192 {
-                        let cut = g.len() - 8192;
-                        g.drain(..cut);
-                    }
-                }
-            });
+        if let Some(err) = child.stderr.take() {
+            tokio::spawn(crate::util::drain_bounded(err, stderr_tail.clone(), 8192));
         }
 
         let ws_url = match discover_ws(port).await {
             Ok(u) => u,
             Err(e) => {
                 let _ = child.start_kill();
-                let tail = stderr_tail.lock().unwrap().clone();
+                // Xvfb was already spawned above (if `cfg.xvfb`): without this,
+                // repeated launch failures here (e.g. an overloaded host where
+                // Chromium never opens its debug port in time) leak its
+                // `/tmp/.X<n>-lock` file forever — `free_display_number` treats
+                // any existing lock file as "taken", so on a 900-number range
+                // enough of these eventually exhaust it even though the host is
+                // otherwise fine.
+                if let Some(x) = &xvfb {
+                    x.kill_sync();
+                }
+                let tail = stderr_tail
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 return Err(BrowserError::Unavailable(format!(
                     "Chromium started but CDP never came up: {e}\n--- chromium stderr (tail) ---\n{}",
                     tail.trim()
@@ -275,16 +273,12 @@ fn running_as_root() -> bool {
 }
 
 fn free_port() -> BrowserResult<u16> {
-    let l = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| BrowserError::Unavailable(format!("cannot pick a debug port: {e}")))?;
-    let p = l
-        .local_addr()
-        .map_err(|e| BrowserError::Unavailable(e.to_string()))?
-        .port();
-    Ok(p)
+    crate::util::free_port()
+        .map_err(|e| BrowserError::Unavailable(format!("cannot pick a debug port: {e}")))
 }
 
 fn resolve_binary(configured: &str) -> BrowserResult<PathBuf> {
+    use crate::util::which;
     if configured != "auto" {
         let p = PathBuf::from(configured);
         return if p.exists() || which(configured).is_some() {
@@ -307,19 +301,6 @@ fn resolve_binary(configured: &str) -> BrowserResult<PathBuf> {
             "no Chromium on PATH (tried {}); set [browser].chromium_path",
             CANDIDATES.join(", ")
         ))
-    })
-}
-
-/// Minimal `which`: scan `$PATH` for an executable file named `name`.
-fn which(name: &str) -> Option<PathBuf> {
-    if name.contains('/') {
-        let p = PathBuf::from(name);
-        return p.is_file().then_some(p);
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(name))
-            .find(|p| p.is_file())
     })
 }
 

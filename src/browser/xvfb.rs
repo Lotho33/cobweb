@@ -22,8 +22,8 @@ pub struct Xvfb {
 
 impl Xvfb {
     pub async fn spawn() -> BrowserResult<Self> {
-        let bin =
-            which("Xvfb").ok_or_else(|| BrowserError::Unavailable("Xvfb not on PATH".into()))?;
+        let bin = crate::util::which("Xvfb")
+            .ok_or_else(|| BrowserError::Unavailable("Xvfb not on PATH".into()))?;
         let n = free_display_number()?;
         let disp = format!(":{n}");
 
@@ -107,12 +107,4 @@ fn free_display_number() -> BrowserResult<u32> {
         }
     }
     Err(BrowserError::Unavailable("no free X display number".into()))
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|d| d.join(name))
-            .find(|p| p.is_file())
-    })
 }

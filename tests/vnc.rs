@@ -85,21 +85,24 @@ async fn full_session_roundtrip() {
         },
         2,
         0,
+        false,
     ));
     let (dir, mgr) = manager(engine.clone());
     let url = format!("{}/challenge", upstream.uri());
 
     let info = mgr.start(&url, None, None).await.expect("session start");
     assert!(!info.id.is_empty());
+    assert!(!info.vnc_token.is_empty());
     assert_eq!(mgr.current().await.id, info.id);
 
     // one at a time
     let again = mgr.start(&url, None, None).await.unwrap_err();
     assert_eq!(again.kind(), "conflict");
 
-    // the bridge can find the RFB port
-    assert!(mgr.rfb_port(&info.id).await.is_some());
-    assert!(mgr.rfb_port("bogus").await.is_none());
+    // the bridge can find the RFB port only with the right id *and* token
+    assert!(mgr.rfb_port(&info.id, &info.vnc_token).await.is_some());
+    assert!(mgr.rfb_port(&info.id, "wrong-token").await.is_none());
+    assert!(mgr.rfb_port("bogus", &info.vnc_token).await.is_none());
 
     mgr.close(&info.id, true).await.expect("session close");
     assert_eq!(mgr.current().await.id, "");

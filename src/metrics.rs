@@ -1,14 +1,20 @@
 //! Minimal Prometheus text exposition — hand-rolled to keep the dep tree small
 //! (deviates from DESIGN.md §7's `metrics` crate; the metric set here is tiny).
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::pipeline::ViaTier;
+use crate::util::BoundedMap;
 
-#[derive(Default)]
+/// Cap on distinct domains tracked for the per-domain counters. The label key
+/// is whatever `registrable_domain()` produces for a caller-supplied URL —
+/// this API has no authentication by default (see `[server].api_key`), so an
+/// unbounded map here is both a slow memory leak on a long-running process and
+/// an unbounded `/metrics` response size for anyone who can reach the API.
+const DOMAIN_CAP: usize = 4096;
+
 pub struct Metrics {
     pub resolve_total: AtomicU64,
     pub resolve_ok: AtomicU64,
@@ -17,8 +23,23 @@ pub struct Metrics {
     pub challenges: AtomicU64,
     /// resolved count per `via_tier` label.
     via: [AtomicU64; 5],
-    /// per registrable-domain: (attempts, ok, challenges).
-    per_domain: Mutex<HashMap<String, [u64; 3]>>,
+    /// per registrable-domain: (attempts, ok, challenges). Capped — see
+    /// [`DOMAIN_CAP`].
+    per_domain: Mutex<BoundedMap<String, [u64; 3]>>,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            resolve_total: AtomicU64::default(),
+            resolve_ok: AtomicU64::default(),
+            resolve_needs_manual: AtomicU64::default(),
+            resolve_error: AtomicU64::default(),
+            challenges: AtomicU64::default(),
+            via: Default::default(),
+            per_domain: Mutex::new(BoundedMap::new(DOMAIN_CAP)),
+        }
+    }
 }
 
 impl Metrics {
@@ -58,7 +79,7 @@ impl Metrics {
     }
 
     fn bump_domain(&self, domain: &str, f: impl FnOnce(&mut [u64; 3])) {
-        let mut g = self.per_domain.lock().unwrap();
+        let mut g = self.per_domain.lock().unwrap_or_else(|e| e.into_inner());
         // Look up first: at steady state the domain is already present, so
         // avoid allocating a key `String` on every resolve.
         if let Some(v) = g.get_mut(domain) {
@@ -128,7 +149,7 @@ impl Metrics {
         }
 
         {
-            let dom = self.per_domain.lock().unwrap();
+            let dom = self.per_domain.lock().unwrap_or_else(|e| e.into_inner());
             let _ = writeln!(o, "# HELP cobweb_domain_attempts_total resolve() attempts by domain\n# TYPE cobweb_domain_attempts_total counter");
             for (d, v) in dom.iter() {
                 let d = esc(d);

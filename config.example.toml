@@ -21,6 +21,14 @@ idle_shutdown_secs = 900  # tear down Chromium after this long with no tier-3 tr
 # firewall's job. 169.254.169.254 and a few always-bogus ranges stay blocked
 # either way.
 allow_private_targets = false
+# Shared secret required on every request (Authorization: Bearer <key>, or
+# X-Api-Key: <key>) except GET /health, the noVNC static assets, and the VNC
+# websocket upgrade (gated instead by its own per-session token — browsers
+# can't attach custom headers to a page navigation or a WebSocket handshake).
+# Unset (the default) => the API is UNAUTHENTICATED; cobweb warns loudly at
+# startup if that's combined with a non-loopback `bind`. Set this to a long
+# random value before exposing cobweb to anything but 127.0.0.1.
+# api_key = "change-me-to-a-long-random-value"
 # Tokio worker threads: env COBWEB_WORKER_THREADS (default 2). A sidecar rarely
 # needs more; raise it only if you drive many concurrent /v1/fetch streams.
 

@@ -174,10 +174,6 @@ impl Tier for FastPathTier {
             .jar
             .map(|j| j.accept_language.as_str())
             .filter(|s| !s.is_empty());
-        let fp = ctx
-            .jar
-            .map(|j| j.fingerprint_id.as_str())
-            .filter(|s| !s.is_empty());
 
         let req = FetchRequest {
             url: ctx.url,
@@ -185,7 +181,6 @@ impl Tier for FastPathTier {
             user_agent: ua,
             accept_language: al,
             cookie_header: cookie_header.as_deref(),
-            fingerprint: fp,
             extra_headers: &[],
             timeout: ctx.timeout,
         };
@@ -196,7 +191,11 @@ impl Tier for FastPathTier {
         };
 
         if looks_like_cloudflare_challenge(resp.status, &resp.body, resp.header("server")) {
-            tracing::info!(url = %ctx.url, status = resp.status, "fast path hit a Cloudflare challenge");
+            tracing::info!(
+                url = %crate::util::redact_url_query(ctx.url),
+                status = resp.status,
+                "fast path hit a Cloudflare challenge"
+            );
             return TierOutcome::Escalate(EscalateReason::Challenge);
         }
         if resp.status == 403 || resp.status == 429 {
@@ -404,6 +403,10 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
     let egress = state
         .egress
         .resolve(params.egress_name.as_deref(), params.proxy_url.as_deref())?;
+    // Vet a caller-supplied `proxy_url` *before* `ensure_available`'s
+    // TCP-connect probe, which would otherwise double as a blind port-scan
+    // oracle against an internal host named in the request.
+    crate::ssrf::guard_egress(&egress, state.config.server.allow_private_targets).await?;
     state.egress.ensure_available(&egress).await?;
 
     // yt-dlp path: for configured hosts, shell out instead of running the tiers.
@@ -698,6 +701,7 @@ pub async fn navigate_fastpath(
     let egress = state
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
+    crate::ssrf::guard_egress(&egress, state.config.server.allow_private_targets).await?;
     state.egress.ensure_available(&egress).await?;
     crate::ssrf::guard_url(
         &url,
@@ -719,10 +723,6 @@ pub async fn navigate_fastpath(
     let al = jar
         .as_ref()
         .map(|j| j.accept_language.as_str())
-        .filter(|s| !s.is_empty());
-    let fp = jar
-        .as_ref()
-        .map(|j| j.fingerprint_id.as_str())
         .filter(|s| !s.is_empty());
 
     let mut extra_headers: Vec<(String, String)> = referer
@@ -746,7 +746,6 @@ pub async fn navigate_fastpath(
             user_agent: ua,
             accept_language: al,
             cookie_header: cookie_header.as_deref(),
-            fingerprint: fp,
             extra_headers: &extra_headers,
             timeout,
         })
@@ -796,6 +795,7 @@ pub async fn browser_sniff(
     let egress = state
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
+    crate::ssrf::guard_egress(&egress, state.config.server.allow_private_targets).await?;
     state.egress.ensure_available(&egress).await?;
     crate::ssrf::guard_url(
         &trigger,
@@ -858,6 +858,7 @@ pub async fn browser_eval(
     let egress = state
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
+    crate::ssrf::guard_egress(&egress, state.config.server.allow_private_targets).await?;
     state.egress.ensure_available(&egress).await?;
     crate::ssrf::guard_url(
         &url,

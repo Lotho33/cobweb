@@ -108,7 +108,7 @@ async fn sniffs_a_url_a_page_script_fetches() {
         .mount(&upstream)
         .await;
 
-    let engine = CdpEngine::new(headless_cfg(), 2, 0); // 0 = no idle reaper
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, false); // 0 = no idle reaper
     engine.ensure_ready().await.expect("Chromium should launch");
     let mut cx = engine
         .acquire(ctx_opts().await)
@@ -150,7 +150,7 @@ async fn navigate_returns_post_js_dom() {
         .mount(&upstream)
         .await;
 
-    let engine = CdpEngine::new(headless_cfg(), 2, 0); // 0 = no idle reaper
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, false); // 0 = no idle reaper
     let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
 
     let url = Url::parse(&format!("{}/p", upstream.uri())).unwrap();
@@ -192,7 +192,7 @@ async fn eval_runs_in_an_isolated_world() {
         .mount(&upstream)
         .await;
 
-    let engine = CdpEngine::new(headless_cfg(), 2, 0); // 0 = no idle reaper
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, false); // 0 = no idle reaper
     let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
     let url = Url::parse(&format!("{}/e", upstream.uri())).unwrap();
 
@@ -231,7 +231,7 @@ async fn storage_state_captures_set_cookie() {
         .mount(&upstream)
         .await;
 
-    let engine = CdpEngine::new(headless_cfg(), 2, 0);
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, false);
     let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
     let url = Url::parse(&format!("{}/set", upstream.uri())).unwrap();
     cx.navigate(

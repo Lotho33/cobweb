@@ -1,14 +1,13 @@
 //! Own an `x11vnc` process attached to the same Xvfb display Chromium is on.
 
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 use crate::error::{CobwebError, Result};
+use crate::util::{drain_bounded, free_port, which};
 
 pub struct X11Vnc {
     child: Child,
@@ -21,7 +20,7 @@ impl X11Vnc {
     pub async fn spawn(disp: &str) -> Result<Self> {
         let bin =
             which("x11vnc").ok_or_else(|| CobwebError::NotImplemented("x11vnc not installed"))?;
-        let port = free_port()?;
+        let port = free_port().map_err(|e| CobwebError::Browser(format!("pick rfb port: {e}")))?;
 
         let mut child = Command::new(&bin)
             .kill_on_drop(true)
@@ -38,9 +37,14 @@ impl X11Vnc {
                 "-rfbport",
                 &port.to_string(),
                 "-localhost", // cobweb is the only client; it bridges the WS
-                "-nopw",      // access is gated by cobweb's HTTP layer / mycelium
-                "-shared",
+                "-nopw",      // access is gated by cobweb's HTTP layer + the per-session
+                // vnc-ws token (SessionManager); see also -shared below
                 "-forever", // don't exit when a viewer disconnects
+                // Deliberately NOT `-shared`: x11vnc then refuses a second
+                // concurrent RFB TCP connection outright, so even a leaked or
+                // guessed vnc-ws token lets an attacker *replace* the admin's
+                // view at most, never silently ride along beside it with its
+                // own mouse/keyboard input.
                 "-noxdamage",
                 "-noxfixes",
                 "-noxrandr",
@@ -50,13 +54,11 @@ impl X11Vnc {
         let pgid = child.id().map(|p| p as i32);
 
         let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        if let Some(mut out) = child.stdout.take() {
-            let sink = stderr_tail.clone();
-            tokio::spawn(async move { drain(&mut out, sink).await });
+        if let Some(out) = child.stdout.take() {
+            tokio::spawn(drain_bounded(out, stderr_tail.clone(), 4096));
         }
-        if let Some(mut err) = child.stderr.take() {
-            let sink = stderr_tail.clone();
-            tokio::spawn(async move { drain(&mut err, sink).await });
+        if let Some(err) = child.stderr.take() {
+            tokio::spawn(drain_bounded(err, stderr_tail.clone(), 4096));
         }
 
         // Wait for the RFB port to accept connections.
@@ -68,7 +70,10 @@ impl X11Vnc {
                 break;
             }
             if let Ok(Some(status)) = child.try_wait() {
-                let tail = stderr_tail.lock().unwrap().clone();
+                let tail = stderr_tail
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 return Err(CobwebError::Browser(format!(
                     "x11vnc exited early ({status}): {}",
                     tail.trim()
@@ -78,7 +83,10 @@ impl X11Vnc {
         }
         if !ok {
             let _ = child.start_kill();
-            let tail = stderr_tail.lock().unwrap().clone();
+            let tail = stderr_tail
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             return Err(CobwebError::Browser(format!(
                 "x11vnc did not open its RFB port: {}",
                 tail.trim()
@@ -98,35 +106,4 @@ impl X11Vnc {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
     }
-}
-
-async fn drain<R: tokio::io::AsyncRead + Unpin>(rd: &mut R, sink: Arc<Mutex<String>>) {
-    let mut chunk = [0u8; 2048];
-    while let Ok(n) = rd.read(&mut chunk).await {
-        if n == 0 {
-            break;
-        }
-        let mut g = sink.lock().unwrap();
-        g.push_str(&String::from_utf8_lossy(&chunk[..n]));
-        if g.len() > 4096 {
-            let cut = g.len() - 4096;
-            g.drain(..cut);
-        }
-    }
-}
-
-fn free_port() -> Result<u16> {
-    let l = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| CobwebError::Browser(format!("pick rfb port: {e}")))?;
-    Ok(l.local_addr()
-        .map_err(|e| CobwebError::Browser(e.to_string()))?
-        .port())
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|d| d.join(name))
-            .find(|p| p.is_file())
-    })
 }

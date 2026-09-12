@@ -18,10 +18,18 @@ use tokio_tungstenite::tungstenite::Message;
 use super::engine::{BrowserError, BrowserResult};
 
 /// A CDP event (`Network.requestWillBeSent`, `Page.lifecycleEvent`, …).
+///
+/// `params` is an `Arc` because every live [`BrowserContext`](super::engine::BrowserContext)
+/// subscribes to the *same* `broadcast` channel off one Chromium-wide
+/// connection (`tokio::sync::broadcast::Receiver::recv` clones the value for
+/// each receiver), so with `max_contexts > 1` a single event — up to a
+/// multi-KB `Network.responseReceived` — was deep-cloned once per concurrent
+/// sniff even though almost every receiver immediately discards it on the
+/// `session_id` filter. Cloning the `Arc` is a refcount bump instead.
 #[derive(Debug, Clone)]
 pub struct CdpEvent {
     pub method: String,
-    pub params: Value,
+    pub params: Arc<Value>,
     pub session_id: Option<String>,
 }
 
@@ -72,7 +80,11 @@ impl CdpClient {
                 };
 
                 if let Some(id) = v.get("id").and_then(Value::as_u64) {
-                    if let Some(tx) = pending_r.lock().unwrap().remove(&id) {
+                    if let Some(tx) = pending_r
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id)
+                    {
                         let res = match v.get("error") {
                             Some(err) => Err(err
                                 .get("message")
@@ -99,13 +111,13 @@ impl CdpClient {
                     let params = v.get_mut("params").map(Value::take).unwrap_or(Value::Null);
                     let _ = events_r.send(CdpEvent {
                         method,
-                        params,
+                        params: Arc::new(params),
                         session_id,
                     });
                 }
             }
             // Connection is gone — unblock every waiter.
-            for (_, tx) in pending_r.lock().unwrap().drain() {
+            for (_, tx) in pending_r.lock().unwrap_or_else(|e| e.into_inner()).drain() {
                 let _ = tx.send(Err("cdp connection closed".into()));
             }
         });
@@ -157,7 +169,10 @@ impl CdpClient {
     ) -> BrowserResult<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
 
         let mut frame = json!({ "id": id, "method": method, "params": params });
         if let Some(sid) = session_id {
@@ -168,7 +183,10 @@ impl CdpClient {
             .send(Message::Text(frame.to_string()))
             .is_err()
         {
-            self.pending.lock().unwrap().remove(&id);
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
             return Err(BrowserError::Cdp("cdp writer gone".into()));
         }
 
@@ -177,7 +195,10 @@ impl CdpClient {
             Ok(Ok(Err(e))) => Err(BrowserError::Cdp(format!("{method}: {e}"))),
             Ok(Err(_)) => Err(BrowserError::Cdp(format!("{method}: response dropped"))),
             Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
                 Err(BrowserError::Cdp(format!("{method}: timed out")))
             }
         }

@@ -202,7 +202,7 @@ pub async fn guard_url(url: &Url, is_direct: bool, allow_private: bool) -> Resul
     }
 
     // A literal IP in the URL: classify without touching DNS, on every egress.
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    if let Ok(ip) = strip_brackets(host).parse::<IpAddr>() {
         if let Some(reason) = block_reason(ip, allow_private) {
             return Err(blocked(host, reason));
         }
@@ -235,10 +235,78 @@ pub async fn guard_url(url: &Url, is_direct: bool, allow_private: bool) -> Resul
     Ok(())
 }
 
+/// `url::Url::host_str()` includes the surrounding brackets for an IPv6
+/// literal host (`"http://[::1]/"` → `"[::1]"`, matching how it must appear
+/// when the URL is re-serialised) — but `std::net::IpAddr::from_str` rejects
+/// brackets outright, so a bare `host.parse::<IpAddr>()` silently fails (and
+/// falls through to the "not a literal IP" path) for exactly the URLs an
+/// attacker would use to smuggle a bracketed IPv6 loopback/private/metadata
+/// address past the literal-IP check below. Strip them first.
+pub(crate) fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 fn blocked(host: &str, reason: &str) -> CobwebError {
     CobwebError::Blocked(format!(
         "refusing to fetch `{host}`: resolves to a {reason} address"
     ))
+}
+
+/// Vet the proxy host of a caller-supplied egress before using it.
+///
+/// [`guard_url`] only ever looks at the *target* URL; when the chosen egress
+/// carries a proxy, everything actually rides through the proxy's host:port
+/// instead — including [`crate::egress::EgressRegistry::ensure_available`]'s
+/// own TCP-connect health check, which runs *before* any other guard and would
+/// otherwise double as a blind port-scan oracle against whatever host a caller
+/// names in `proxy_url`. A `[egress.*]` profile from the config file is
+/// operator-configured and trusted (the operator owns that exit, same as
+/// `guard_url`'s treatment of a *target* reached through a proxied egress);
+/// only a raw `proxy_url` supplied on the request itself — tagged
+/// `"raw:<url>"` by [`crate::egress::Egress::from_raw_proxy`] — is untrusted
+/// input and needs this check.
+pub async fn guard_egress(egress: &crate::egress::Egress, allow_private: bool) -> Result<()> {
+    if !egress.name.starts_with("raw:") {
+        return Ok(()); // operator-configured profile: trusted, operator owns the exit
+    }
+    let Some(proxy) = &egress.proxy else {
+        return Ok(());
+    };
+    let Some(host) = proxy.host_str() else {
+        return Err(CobwebError::BadRequest("proxy_url has no host".into()));
+    };
+
+    let lower = host.to_ascii_lowercase();
+    if !allow_private && (lower == "localhost" || lower.ends_with(".localhost")) {
+        return Err(blocked(host, "localhost"));
+    }
+
+    if let Ok(ip) = strip_brackets(host).parse::<IpAddr>() {
+        if let Some(reason) = block_reason(ip, allow_private) {
+            return Err(blocked(host, reason));
+        }
+        return Ok(());
+    }
+
+    // A hostname proxy: resolve and vet every address, same rationale as
+    // `guard_url`'s direct-egress branch — a resolution failure is not itself
+    // "blocked" (the connect that follows can't reach it either).
+    let port = proxy.port_or_known_default().unwrap_or(0);
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => {
+            for sa in addrs {
+                if let Some(reason) = block_reason(sa.ip(), allow_private) {
+                    return Err(blocked(host, reason));
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!(%host, error = %e, "ssrf guard: could not resolve proxy_url host")
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -354,6 +422,30 @@ mod tests {
         assert!(guard_url(&lo, true, true).await.is_ok());
     }
 
+    // Regression: `Url::host_str()` keeps the brackets for an IPv6 literal
+    // (`"[::1]"`), and `IpAddr::from_str` rejects a bracketed string outright
+    // — a bare `host.parse::<IpAddr>()` therefore missed the literal-IP branch
+    // entirely for a bracketed IPv6 target, on both `guard_url` and
+    // `guard_egress`, letting it fall through as if it weren't a literal IP at
+    // all. Found via the `strip_brackets` fix, not by inspection — worth its
+    // own guard against a future refactor reintroducing a bare `.parse()`.
+    #[tokio::test]
+    async fn guard_url_rejects_bracketed_ipv6_literals() {
+        for s in [
+            "http://[::1]/",
+            "http://[::1]:8080/x",
+            "http://[fd00::1]/",
+            "http://[fe80::1]/",
+        ] {
+            let u = Url::parse(s).unwrap();
+            assert!(guard_url(&u, true, false).await.is_err(), "{s} on direct");
+            assert!(guard_url(&u, false, false).await.is_err(), "{s} on proxied");
+        }
+        // relaxed: ordinary private IPv6 passes, same as its IPv4 counterpart
+        let u = Url::parse("http://[fd00::1]/").unwrap();
+        assert!(guard_url(&u, true, true).await.is_ok());
+    }
+
     #[tokio::test]
     async fn guard_url_rejects_non_http_schemes() {
         let u = Url::parse("file:///etc/passwd").unwrap();
@@ -361,5 +453,92 @@ mod tests {
             guard_url(&u, true, true).await,
             Err(CobwebError::Blocked(_))
         ));
+    }
+
+    fn raw_egress(url: &str) -> crate::egress::Egress {
+        crate::egress::Egress::from_raw_proxy(url).unwrap()
+    }
+
+    fn named_egress(name: &str, url: &str) -> crate::egress::Egress {
+        crate::egress::Egress {
+            name: name.to_string(),
+            proxy: Some(Url::parse(url).unwrap()),
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_egress_blocks_a_raw_proxy_url_pointing_at_a_private_host() {
+        // e.g. `proxy_url: "http://127.0.0.1:2375/"` (a Docker socket proxy, an
+        // internal admin panel, ...) — this must never reach ensure_available's
+        // TCP-connect probe, let alone the actual request.
+        for url in [
+            "http://127.0.0.1:2375/",
+            "http://10.0.0.5:6379",
+            "http://169.254.169.254/",
+            "socks5://[::1]:1080",
+        ] {
+            let e = raw_egress(url);
+            assert!(
+                guard_egress(&e, false).await.is_err(),
+                "{url} should be blocked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_egress_allows_a_raw_proxy_url_pointing_at_a_public_host() {
+        // NOT 203.0.113.0/24 / 192.0.2.0/24 / 198.51.100.0/24 — those are the
+        // RFC 5737 TEST-NET ranges, which `Ipv4Addr::is_documentation()` (and
+        // so `block_reason`) correctly treats as always-blocked, not "public".
+        let e = raw_egress("socks5://93.184.216.34:1080");
+        assert!(guard_egress(&e, false).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn guard_egress_trusts_a_named_config_profile_even_if_private() {
+        // A `[egress.*]` profile is operator-configured (e.g. a WireGuard
+        // sidecar reachable only at a private container IP) — never subject to
+        // this check, unlike a raw `proxy_url` from a request.
+        let e = named_egress("mullvad", "socks5://10.0.0.9:1080");
+        assert!(guard_egress(&e, false).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn guard_egress_allows_direct() {
+        assert!(guard_egress(&crate::egress::Egress::direct(), false)
+            .await
+            .is_ok());
+    }
+
+    // `guard_url` only ever vets the *entry-point* URL of a request; the
+    // property that a *redirect* hop is also vetted (DESIGN.md §6.3: "the same
+    // predicate is the wreq DNS resolver... so it re-runs on every redirect
+    // hop") lives entirely in `GuardedResolver`, since `wreq` calls its
+    // installed resolver again for every new connection a redirect causes —
+    // identically to the first one. There is no separate "redirect guard" to
+    // test end-to-end (and no hermetic way to make a test server look like a
+    // "public" host that then redirects to a "private" one without reaching
+    // the real network); testing that this resolver refuses to resolve a
+    // private/loopback name is a faithful, direct test of the exact mechanism
+    // a redirect hop goes through.
+    #[tokio::test]
+    async fn guarded_resolver_blocks_localhost_and_allows_it_when_relaxed() {
+        use wreq::dns::{Name, Resolve};
+
+        let strict = GuardedResolver::new(false);
+        assert!(
+            Resolve::resolve(&strict, Name::from("localhost"))
+                .await
+                .is_err(),
+            "a resolution landing on loopback must be refused when allow_private is false"
+        );
+
+        let relaxed = GuardedResolver::new(true);
+        assert!(
+            Resolve::resolve(&relaxed, Name::from("localhost"))
+                .await
+                .is_ok(),
+            "allow_private_targets = true must let a loopback resolution through"
+        );
     }
 }

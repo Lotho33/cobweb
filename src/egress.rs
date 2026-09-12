@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::util::BoundedMap;
+
 use url::Url;
 
 use crate::config::Config;
@@ -75,11 +77,18 @@ struct HealthEntry {
 
 const HEALTHCHECK_TTL: Duration = Duration::from_secs(30);
 
+/// Cap on distinct egress health entries. Named `[egress.*]` profiles are a
+/// handful, but the key here is `Egress::name`, which for a caller-supplied
+/// `proxy_url` (unauthenticated by default — see `[server].api_key`) is
+/// `"raw:<the whole url>"`: a distinct string per distinct proxy_url ever
+/// requested, so this needs the same cap as the metrics per-domain map.
+const HEALTH_CAP: usize = 1024;
+
 pub struct EgressRegistry {
     profiles: HashMap<String, Egress>,
     /// name -> last health check. `Mutex` because checks are cheap and rare;
     /// no need for an async lock.
-    health: Mutex<HashMap<String, HealthEntry>>,
+    health: Mutex<BoundedMap<String, HealthEntry>>,
 }
 
 impl EgressRegistry {
@@ -107,7 +116,7 @@ impl EgressRegistry {
             .or_insert_with(Egress::direct);
         Ok(Self {
             profiles,
-            health: Mutex::new(HashMap::new()),
+            health: Mutex::new(BoundedMap::new(HEALTH_CAP)),
         })
     }
 
@@ -151,7 +160,12 @@ impl EgressRegistry {
             return Ok(());
         };
 
-        if let Some(entry) = self.health.lock().unwrap().get(&e.name) {
+        if let Some(entry) = self
+            .health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&e.name)
+        {
             if entry.checked_at.elapsed() < HEALTHCHECK_TTL {
                 return if entry.ok {
                     Ok(())
@@ -165,13 +179,16 @@ impl EgressRegistry {
         }
 
         let ok = tcp_reachable(proxy).await;
-        self.health.lock().unwrap().insert(
-            e.name.clone(),
-            HealthEntry {
-                ok,
-                checked_at: Instant::now(),
-            },
-        );
+        self.health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                e.name.clone(),
+                HealthEntry {
+                    ok,
+                    checked_at: Instant::now(),
+                },
+            );
 
         if ok {
             Ok(())

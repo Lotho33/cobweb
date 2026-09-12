@@ -28,8 +28,6 @@ pub struct FetchRequest<'a> {
     pub accept_language: Option<&'a str>,
     /// Pre-built `Cookie:` header value from the jar (already domain-filtered).
     pub cookie_header: Option<&'a str>,
-    /// Impersonation profile id (e.g. `chrome-147`). `None` => client default.
-    pub fingerprint: Option<&'a str>,
     pub extra_headers: &'a [(String, String)],
     pub timeout: Duration,
 }
@@ -71,7 +69,7 @@ pub trait FastClient: Send + Sync {
 // wreq implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `wreq`-backed client. Holds one `wreq::Client` per `(egress, fingerprint)` —
+/// `wreq`-backed client. Holds one `wreq::Client` per `(egress, kind)` —
 /// building one sets up a TLS/H2 fingerprint and a proxy connector, both worth
 /// reusing across requests.
 pub struct WreqClient {
@@ -98,34 +96,30 @@ impl WreqClient {
         }
     }
 
-    fn emulation_for(_fingerprint: Option<&str>) -> wreq_util::Profile {
-        // TODO(M2): map the jar's `fingerprint_id` onto other `wreq_util::Profile`
-        // variants (Firefox*, Safari*, Edge*). For now every fast-path request
-        // impersonates a current Chrome — the profile the browser tier will pin too.
-        wreq_util::Profile::Chrome147
-    }
-
-    fn client_for(
-        &self,
-        egress: &Egress,
-        fingerprint: Option<&str>,
-        kind: ClientKind,
-    ) -> Result<wreq::Client> {
+    fn client_for(&self, egress: &Egress, kind: ClientKind) -> Result<wreq::Client> {
         let kind_tag = match kind {
             ClientKind::FastPath => "fp",
             ClientKind::Stream => "st",
         };
-        let key = format!(
-            "{}|{}|{kind_tag}",
-            egress.jar_key(),
-            fingerprint.unwrap_or("default")
-        );
-        if let Some(c) = self.cache.lock().unwrap().get(&key) {
+        let key = format!("{}|{kind_tag}", egress.jar_key());
+        if let Some(c) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
             return Ok(c.clone());
         }
 
         let mut builder = wreq::Client::builder()
-            .emulation(Self::emulation_for(fingerprint))
+            // Every request impersonates a current desktop Chrome — the only
+            // profile actually pinned anywhere else in cobweb (the browser
+            // tier's own UA/launch flags). A per-jar-entry `fingerprint_id`
+            // was speculatively wired through the jar and this call for a
+            // future per-domain impersonation profile, but nothing ever wrote
+            // one and this was the only reader — removed rather than kept as
+            // a field that promised behaviour the code didn't have.
+            .emulation(wreq_util::Profile::Chrome147)
             // SSRF guard: resolve + vet every address, re-run on each redirect.
             .dns_resolver(crate::ssrf::GuardedResolver::new(
                 self.allow_private_targets,
@@ -161,7 +155,10 @@ impl WreqClient {
         let client = builder
             .build()
             .map_err(|e| CobwebError::Other(anyhow::anyhow!("build wreq client: {e}")))?;
-        self.cache.lock().unwrap().insert(key, client.clone());
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, client.clone());
         Ok(client)
     }
 }
@@ -176,11 +173,11 @@ impl FastClient for WreqClient {
     /// truncate a long segment / progressive file mid-stream), just connect +
     /// read-inactivity guards. Shares the per-egress pool with the fast path.
     fn raw_client(&self, egress: &Egress) -> Result<wreq::Client> {
-        self.client_for(egress, None, ClientKind::Stream)
+        self.client_for(egress, ClientKind::Stream)
     }
 
     async fn fetch(&self, req: FetchRequest<'_>) -> Result<FetchResponse> {
-        let client = self.client_for(req.egress, req.fingerprint, ClientKind::FastPath)?;
+        let client = self.client_for(req.egress, ClientKind::FastPath)?;
 
         let mut rb = client.get(req.url.as_str()).timeout(req.timeout);
         if let Some(ua) = req.user_agent {
