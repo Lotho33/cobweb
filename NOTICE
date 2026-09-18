@@ -1,0 +1,47 @@
+cobweb
+Copyright (c) 2026 Lotho33
+
+This product is licensed under the MIT License (see LICENSE).
+
+It includes or builds upon third-party components under their own licenses:
+
+────────────────────────────────────────────────────────────────────────────
+noVNC  —  git submodule at vendor/novnc (github.com/novnc/noVNC), copied to
+/opt/novnc in the Docker image.
+  * Core library (core/**/*.js, app/*.js, …): Mozilla Public License 2.0
+  * HTML / CSS files: 2-Clause BSD License
+  * app/styles/Orbitron* font: SIL Open Font License 1.1
+      (Copyright 2009 Matt McInerney)
+  * app/images/*: Creative Commons Attribution-ShareAlike 3.0
+  Full text: vendor/novnc/LICENSE.txt and vendor/novnc/AUTHORS.
+
+────────────────────────────────────────────────────────────────────────────
+BoringSSL  —  compiled from source and statically linked via the `btls` /
+`btls-sys` crates, which provide the TLS backend for `wreq`.
+  BoringSSL is distributed under a mix of the OpenSSL License, the original
+  SSLeay license, and ISC / MIT terms for individual files, plus third-party
+  code under its own terms. See the `btls-sys` crate's bundled BoringSSL
+  source tree for the authoritative LICENSE.
+
+────────────────────────────────────────────────────────────────────────────
+Public Suffix List  —  the registrable-domain data compiled into the binary
+via the `psl` crate originates from Mozilla's Public Suffix List
+(publicsuffix.org), available under the Mozilla Public License 2.0.
+
+────────────────────────────────────────────────────────────────────────────
+Rust crate dependencies  —  every other compiled-in dependency (see
+Cargo.lock) is distributed under permissive terms: predominantly
+"MIT OR Apache-2.0", with some BSD-2/3-Clause, ISC, Zlib, Unicode-3.0,
+Unlicense, 0BSD, BSL-1.0 and CDLA-Permissive-2.0. No dependency imposes a
+copyleft obligation on this project. Run `cargo deny check licenses` for a
+machine-checked report.
+
+────────────────────────────────────────────────────────────────────────────
+Chromium  —  NOT bundled. The Docker image installs the distribution's
+`chromium` package at build time; cobweb drives it over the DevTools
+protocol. Chromium is licensed under the BSD-3-Clause License with
+additional third-party components under their own terms.
+
+yt-dlp  —  NOT bundled by default (opt-in `WITH_YTDLP=1` build arg). When
+enabled it is installed as a separate binary (Unlicense) and invoked as a
+subprocess; it is not linked.

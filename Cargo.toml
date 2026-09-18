@@ -1,0 +1,88 @@
+[package]
+name = "cobweb"
+version = "1.1.1"
+edition = "2021"
+rust-version = "1.82"
+description = "Self-hosted headless-browser fetch sidecar: resolves HLS/DASH stream URLs from player pages an operator is authorised to access, with a persistent per-domain cookie jar."
+license = "MIT"
+repository = "https://github.com/Lotho33/cobweb"
+default-run = "cobweb"
+
+[[bin]]
+name = "cobweb"
+path = "src/main.rs"
+
+# The crate is also a library so `tests/` can drive the pipeline directly
+# (spin up the axum app on an ephemeral port) without going through the binary.
+[lib]
+name = "cobweb"
+path = "src/lib.rs"
+
+[features]
+# `ytdlp` is deliberately NOT in `default`: it shells out to a fast-moving,
+# heavyweight external binary. Opt in with --features ytdlp (and ship the binary).
+#
+# There used to be a `vnc` feature here (an interactive, human-in-the-loop
+# Cloudflare/Turnstile solver over noVNC — Xvfb + x11vnc + a websocket
+# bridge). Removed entirely, not just defaulted off: cobweb is meant to be a
+# plain headless extractor (tier 2 fast-path + tier 3 browser sniff), not a
+# tool engineered to defeat a site's anti-bot protection by hand. Automated
+# Cloudflare bypass, for operators who want it, is tier 3b — point
+# [flaresolverr].endpoint at your own separately-run FlareSolverr instance
+# (see README.md); that was already independent of `vnc` and needed no
+# changes here.
+default = ["flaresolverr"]
+flaresolverr = []
+ytdlp        = []
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "time", "sync", "net", "process", "io-util"] }
+axum = { version = "0.8", features = ["json", "tokio", "http1", "ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "limit", "catch-panic", "fs"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Tier-2 engine: browser TLS/HTTP2 impersonation (BoringSSL). Behind the
+# `FastClient` trait in fastpath.rs so it can be swapped for `impit` — DESIGN.md §14.1.
+wreq = { version = "0.16", features = ["socks", "gzip", "brotli", "deflate", "json", "stream"] }
+wreq-util = "0.2"
+
+url = "2"
+regex = "1"
+globset = "0.4"
+# Registrable-domain extraction against a compiled Public Suffix List.
+psl = "2"
+# Configurable DNS resolver for [settings].dns_servers (src/settings.rs) —
+# same version `wreq` itself depends on (optionally, behind its unused
+# `hickory-dns` feature); built as our own swappable `TokioResolver`
+# instances rather than wreq's bundled singleton wrapper.
+hickory-resolver = "0.26"
+
+# Hand-rolled CDP client transport (DESIGN.md §3) — plaintext ws://127.0.0.1, no TLS.
+tokio-tungstenite = "0.23"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+base64 = "0.22"   # decode CDP getResponseBody payloads for the body sniff
+libc = "0.2"      # kill the Chromium process *group* on teardown (no orphans)
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+
+clap = { version = "4", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+wiremock = "0.6"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

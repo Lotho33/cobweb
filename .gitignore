@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# local runtime
+/config.toml
+/data/
+*.log
+
+# editor / OS
+.DS_Store

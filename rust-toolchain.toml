@@ -1,0 +1,5 @@
+# Pin the toolchain so CI, contributors and `cargo fmt` all agree.
+# On a `stable` bump that reformats code, re-run `cargo fmt` in the same commit.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

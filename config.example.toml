@@ -1,0 +1,118 @@
+# cobweb configuration — copy to config.toml and set COBWEB_CONFIG=/path/to/config.toml
+# See DESIGN.md for the full rationale behind each knob.
+
+[server]
+# Bind address. Defaults to 127.0.0.1: the API is unauthenticated and exposes an
+# SSRF-capable fetcher plus a browser-eval endpoint, so it must never face an
+# untrusted network directly. Use "0.0.0.0" (or "::") only behind a trusted
+# reverse proxy or on an internal container network.
+bind         = "127.0.0.1"
+port         = 8191
+# "chromium" = full pipeline. "none" = fast-path only, tiers 3-4 disabled,
+# process stays ~10 MB (for deployments whose sources have no bot protection).
+browser_engine = "chromium"
+max_contexts = 2          # concurrent browser contexts; requests beyond this queue
+                          # (static — resizing this live isn't safe; see [settings] below
+                          # for the idle-shutdown threshold, which IS live-tunable)
+# SSRF guard. false (default): every fetcher resolves the target first and
+# refuses any private / loopback / link-local / CGNAT / ULA address, re-checked
+# after each redirect. Set true ONLY if cobweb is meant to reach hosts on your
+# own private network (e.g. a LAN media server) — containment is then your
+# firewall's job. 169.254.169.254 and a few always-bogus ranges stay blocked
+# either way.
+allow_private_targets = false
+# Shared secret required on every request (Authorization: Bearer <key>, or
+# X-Api-Key: <key>) except GET /health.
+# Unset (the default) => the API is UNAUTHENTICATED; cobweb warns loudly at
+# startup if that's combined with a non-loopback `bind`. Set this to a long
+# random value before exposing cobweb to anything but 127.0.0.1.
+# api_key = "change-me-to-a-long-random-value"
+# Tokio worker threads: env COBWEB_WORKER_THREADS (default 2). A sidecar rarely
+# needs more; raise it only if you drive many concurrent /v1/fetch streams.
+
+# ─── Browser tier (only used when browser_engine = "chromium") ────────────────
+[browser]
+chromium_path = "auto"    # "auto" searches PATH (chromium, chromium-browser, google-chrome)
+no_sandbox    = false     # auto-forced true when cobweb runs as root (typical in containers)
+prewarm       = false     # true = launch Chromium at startup, never idle-shutdown (no cold start)
+# extra_args = ["--disable-dev-shm-usage"]
+# Per-navigation default timeout moved to [settings]/GET/PATCH /v1/settings
+# (nav_timeout_ms) — a request-tuning knob, not a launch flag.
+
+[jar]
+path = "/data/jar"
+# default_ttl_secs / fail_streak moved to [settings]/GET/PATCH /v1/settings
+# (jar_default_ttl_secs / jar_fail_streak).
+
+# ─── Egress profiles ─────────────────────────────────────────────────────────
+# Each request names one of these ("egress": "mullvad") or passes a raw
+# "proxy_url" (cobweb back-compat). A named egress that is configured but
+# unreachable FAILS the request — it never falls back to direct.
+
+[egress.direct]
+proxy = ""
+
+[egress.mullvad]
+proxy = "socks5://mullvad:1080"
+
+[egress.proton]
+proxy = "socks5://proton:1080"
+
+[egress.warp]
+proxy = "socks5://warp:1080"
+
+# ─── Optional: delegate hard challenges to an external FlareSolverr ───────────
+# Unset `endpoint` to disable tier 3b. When set, a challenge cobweb's own browser
+# can't pass is forwarded here; the returned cookies are merged into the jar and
+# ridden by the fast-path until they go stale.
+[flaresolverr]
+# endpoint = "http://flaresolverr:8191"
+# session_ttl_secs moved to [settings]/GET/PATCH /v1/settings
+# (flaresolverr_session_ttl_secs).
+
+# ─── Optional: yt-dlp subprocess for signature-heavy hosts ───────────────────
+[ytdlp]
+enabled = false
+bin     = "yt-dlp"
+hosts   = ["youtube.com", "youtu.be", "vimeo.com", "dailymotion.com"]
+
+# ─── Optional: AdGuard-style tracker/ad domain blocklist (tier-3 sniff only) ──
+# Independent of `block_resources` (built-in media/ad-domain blocking).
+# Unlike the rest of this file, the list sources and the on/off switch are
+# NOT configured here — they're runtime state managed over HTTP (same
+# [server].api_key auth as the rest of /v1/*), the same way jar entries are
+# managed via GET/DELETE /v1/jar instead of a config file:
+#   GET/PATCH   /v1/blocklist                — status, master on/off
+#   POST        /v1/blocklist/sources        — add a source by URL
+#   PATCH       /v1/blocklist/sources/{id}   — enable/disable one source
+#   DELETE      /v1/blocklist/sources/{id}   — remove one source
+#   POST        /v1/blocklist/refresh        — force an immediate re-fetch
+# Off by default (no sources added, master switch starts disabled) — a
+# public list CAN false-positive and break a site's manifest resolution.
+# Toggle per request with "block_trackers" (defaults to true; a no-op until
+# the master switch above is turned on and has at least one enabled source).
+[blocklist]
+state_path             = "/data/blocklist/state.json"   # sources + on/off switch, survives restarts
+refresh_interval_secs  = 86400   # 24h
+extra_domains = []   # always-block additions, no source URL needed
+allow_domains = []   # escape hatch for a source's false positive
+
+# ─── Runtime-configurable operational settings ────────────────────────────────
+# DNS servers + timeout/TTL knobs, same "not config, runtime state" treatment
+# as [blocklist] above:
+#   GET/PATCH /v1/settings   — { dns_servers, nav_timeout_ms,
+#                                 jar_default_ttl_secs, jar_fail_streak,
+#                                 flaresolverr_session_ttl_secs,
+#                                 idle_shutdown_secs }
+# dns_servers defaults to ["1.1.1.1", "1.0.0.1"] (Cloudflare) rather than the
+# host/container resolver, since a target site being DNS-blocked by an ISP is
+# a real failure mode for what cobweb resolves. The configured server(s) are
+# tried first and fall back to the system resolver on failure — this is what
+# keeps a SOCKS5/HTTP proxy's own hostname (e.g. the "mullvad"/"warp" Compose
+# service names above) resolving even though they're not public DNS records.
+# Set dns_servers to [] via the API to use the system resolver only.
+[settings]
+state_path = "/data/settings.json"   # survives restarts
+
+[log]
+level = "info"   # trace | debug | info | warn | error
