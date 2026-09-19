@@ -748,6 +748,7 @@ impl BrowserContext for CdpContext {
         trigger: &Url,
         pattern: &GlobSet,
         timeout: Duration,
+        interact_js: Option<&str>,
     ) -> BrowserResult<SniffHit> {
         let mut ev = self.client.subscribe();
 
@@ -825,8 +826,36 @@ impl BrowserContext for CdpContext {
         let mut next_probe = Instant::now() + Duration::from_secs(3);
         let mut challenge_since: Option<Instant> = None;
 
+        // Optional page interaction (e.g. clicking a play button that only
+        // appears after the page's own XHRs finish). Retried every
+        // INTERACT_EVERY until the script returns a truthy value.
+        const INTERACT_EVERY: Duration = Duration::from_millis(1500);
+        let mut interact_done = interact_js.is_none();
+        let mut next_interact = Instant::now() + Duration::from_secs(2);
+
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
+
+            if !interact_done && pending.is_none() && Instant::now() >= next_interact && !remaining.is_zero() {
+                next_interact = Instant::now() + INTERACT_EVERY;
+                if let Some(js) = interact_js {
+                    match self.iso_eval(js, Duration::from_secs(5)).await {
+                        Ok(v) => {
+                            let truthy = match &v {
+                                Value::Null | Value::Bool(false) => false,
+                                Value::String(s) => !s.is_empty(),
+                                Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+                                _ => true,
+                            };
+                            if truthy {
+                                tracing::debug!(result = %v, "sniff: interact_js done");
+                                interact_done = true;
+                            }
+                        }
+                        Err(e) => tracing::debug!(error = %e, "sniff: interact_js failed, will retry"),
+                    }
+                }
+            }
 
             if Instant::now() >= next_probe && !remaining.is_zero() {
                 next_probe = Instant::now() + PROBE_EVERY;
@@ -877,7 +906,7 @@ impl BrowserContext for CdpContext {
                 break;
             }
 
-            let wait = match &pending {
+            let mut wait = match &pending {
                 Some(_) => pending_until
                     .saturating_duration_since(Instant::now())
                     .min(remaining),
@@ -885,6 +914,9 @@ impl BrowserContext for CdpContext {
             }
             // Never sleep past the next challenge probe, even with no events.
             .min(next_probe.saturating_duration_since(Instant::now()));
+            if !interact_done {
+                wait = wait.min(next_interact.saturating_duration_since(Instant::now()));
+            }
             let e = match tokio::time::timeout(wait, ev.recv()).await {
                 Ok(Ok(e)) => e,
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {

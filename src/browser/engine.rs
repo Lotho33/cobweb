@@ -126,6 +126,7 @@ pub trait BrowserContext: Send {
         trigger: &Url,
         pattern: &GlobSet,
         timeout: Duration,
+        interact_js: Option<&str>,
     ) -> BrowserResult<SniffHit>;
 
     /// Run `js` in a fresh `Page.createIsolatedWorld`; returns the JSON result.

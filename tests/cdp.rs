@@ -125,7 +125,7 @@ async fn sniffs_a_url_a_page_script_fetches() {
     let patterns = build_globset(&["*.m3u8".to_string()]).unwrap();
 
     let hit = cx
-        .sniff(&trigger, &patterns, Duration::from_secs(20))
+        .sniff(&trigger, &patterns, Duration::from_secs(20), None)
         .await
         .expect("sniff should catch the fetch");
     assert!(

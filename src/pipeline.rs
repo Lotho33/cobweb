@@ -138,6 +138,8 @@ pub struct ResolveCtx<'a> {
     pub block_trackers: bool,
     /// Fresh jar entry seeding this call, if any.
     pub jar: Option<&'a JarEntry>,
+    /// Optional JS to run after load during a browser sniff (`/v1/sniff` only).
+    pub interact_js: Option<&'a str>,
 }
 
 #[async_trait]
@@ -273,7 +275,7 @@ impl Tier for BrowserSniffTier {
             Err(e) => return TierOutcome::Failed(e.into()),
         };
 
-        let outcome = match cx.sniff(ctx.url, ctx.url_pattern, ctx.timeout).await {
+        let outcome = match cx.sniff(ctx.url, ctx.url_pattern, ctx.timeout, ctx.interact_js).await {
             Ok(hit) => {
                 let state = cx.storage_state().await.unwrap_or_default();
                 let kind = StreamKind::from_url(&hit.url).unwrap_or(StreamKind::Hls);
@@ -469,6 +471,7 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
         block_resources: params.block_resources,
         block_trackers: params.block_trackers,
         jar: jar_entry.as_ref(),
+        interact_js: None,
     };
 
     let mut last_reason = EscalateReason::NeedsJs;
@@ -603,6 +606,7 @@ async fn try_flaresolverr(
         block_resources: params.block_resources,
         block_trackers: params.block_trackers,
         jar: fresh.as_ref(),
+        interact_js: None,
     };
     Some(browser_tier.try_resolve(&ctx).await)
 }
@@ -793,6 +797,7 @@ pub async fn browser_sniff(
     egress_name: Option<String>,
     proxy_url: Option<String>,
     timeout: Duration,
+    interact_js: Option<String>,
 ) -> Result<SniffResult> {
     let tier = state.browser_tier.as_ref().ok_or_else(|| {
         CobwebError::NeedsBrowser(
@@ -825,6 +830,7 @@ pub async fn browser_sniff(
         block_resources: true,
         block_trackers: true,
         jar: jar_entry.as_ref(),
+        interact_js: interact_js.as_deref(),
     };
 
     match tier.try_resolve(&ctx).await {

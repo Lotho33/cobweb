@@ -164,6 +164,11 @@ pub struct SniffRequest {
     pub proxy_url: Option<String>,
     #[serde(default)]
     pub egress: Option<String>,
+    /// JS run (isolated world) after load, retried every ~1.5 s until it
+    /// returns a truthy value — e.g. click a play button so the player fires
+    /// the request the sniff is waiting for.
+    #[serde(default)]
+    pub interact_js: Option<String>,
 }
 
 impl SniffRequest {

@@ -287,11 +287,22 @@ pub async fn sniff(
     let timeout = req.timeout(st.settings.nav_timeout_ms());
     let pattern = pipeline::normalize_sniff_pattern(req.url_pattern.trim());
     let SniffRequest {
-        egress, proxy_url, ..
+        egress,
+        proxy_url,
+        interact_js,
+        ..
     } = req;
 
-    let r =
-        pipeline::browser_sniff(&st, trigger, vec![pattern], egress, proxy_url, timeout).await?;
+    let r = pipeline::browser_sniff(
+        &st,
+        trigger,
+        vec![pattern],
+        egress,
+        proxy_url,
+        timeout,
+        interact_js,
+    )
+    .await?;
 
     // mycelium's browser_client.go wants {intercepted_url, headers}.
     Ok(Json(SniffResponse {
