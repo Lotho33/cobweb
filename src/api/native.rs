@@ -238,7 +238,7 @@ pub async fn fetch(
     let resp = rb
         .send()
         .await
-        .map_err(|e| CobwebError::Upstream(format!("GET {url}: {e}")))?;
+        .map_err(|e| crate::util::upstream_error("GET", &url, e))?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let final_url = resp.uri().to_string();

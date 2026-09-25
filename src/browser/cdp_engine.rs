@@ -836,7 +836,11 @@ impl BrowserContext for CdpContext {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
 
-            if !interact_done && pending.is_none() && Instant::now() >= next_interact && !remaining.is_zero() {
+            if !interact_done
+                && pending.is_none()
+                && Instant::now() >= next_interact
+                && !remaining.is_zero()
+            {
                 next_interact = Instant::now() + INTERACT_EVERY;
                 if let Some(js) = interact_js {
                     match self.iso_eval(js, Duration::from_secs(5)).await {
@@ -852,7 +856,9 @@ impl BrowserContext for CdpContext {
                                 interact_done = true;
                             }
                         }
-                        Err(e) => tracing::debug!(error = %e, "sniff: interact_js failed, will retry"),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "sniff: interact_js failed, will retry")
+                        }
                     }
                 }
             }

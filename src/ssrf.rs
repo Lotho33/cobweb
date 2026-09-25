@@ -312,6 +312,51 @@ pub async fn guard_egress(egress: &crate::egress::Egress, allow_private: bool) -
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// wreq redirect policy
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Max redirect hops a `wreq` client follows (same as `Policy::limited(10)`).
+pub const MAX_REDIRECTS: usize = 10;
+
+/// Why a redirect to `host` must be refused, if it must. Covers exactly the
+/// case [`GuardedResolver`] can't: an **IP-literal** host, for which `wreq`
+/// never calls the DNS resolver — without this, a public page answering
+/// `302 Location: http://192.168.1.1/…` (or `169.254.169.254`) sailed past the
+/// SSRF guard, since [`guard_url`] only vets the entry-point URL. Hostnames
+/// are left to the resolver (it re-runs on every hop). Same rule as
+/// [`guard_url`]: literals are vetted on ANY egress (a proxy would happily
+/// reach its own LAN), `localhost` names are refused unless relaxed.
+pub fn redirect_block_reason(host: &str, allow_private: bool) -> Option<&'static str> {
+    let bare = strip_brackets(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return block_reason(ip, allow_private);
+    }
+    let lower = bare.to_ascii_lowercase();
+    if !allow_private && (lower == "localhost" || lower.ends_with(".localhost")) {
+        return Some("loopback (localhost)");
+    }
+    None
+}
+
+/// The redirect policy every `wreq` client in cobweb uses: at most
+/// [`MAX_REDIRECTS`] hops, each hop's host vetted by [`redirect_block_reason`].
+pub fn redirect_policy(allow_private: bool) -> wreq::redirect::Policy {
+    wreq::redirect::Policy::custom(move |attempt| {
+        // `previous` includes the initial request, which is not a redirect.
+        if attempt.previous.len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        let host = attempt.uri.host().unwrap_or("").to_string();
+        match redirect_block_reason(&host, allow_private) {
+            Some(reason) => attempt.error(format!(
+                "ssrf: refusing redirect to `{host}`: {reason} address"
+            )),
+            None => attempt.follow(),
+        }
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // wreq DNS resolver
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -563,6 +608,39 @@ mod tests {
             .await
             .unwrap();
         settings
+    }
+
+    // The resolver never runs for an IP-literal host, so redirect hops to a
+    // literal are vetted by `redirect_block_reason` instead (redirect_policy).
+    #[test]
+    fn redirect_block_reason_vets_literals_and_localhost() {
+        // strict
+        for h in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "169.254.169.254",
+            "[::1]",
+            "[fd00::1]",
+            "localhost",
+            "a.localhost",
+        ] {
+            assert!(
+                redirect_block_reason(h, false).is_some(),
+                "{h} must be refused"
+            );
+        }
+        for h in ["93.184.216.34", "example.com", "cdn.example.org"] {
+            assert!(
+                redirect_block_reason(h, false).is_none(),
+                "{h} must be allowed"
+            );
+        }
+        // relaxed: private ok, hard ranges still refused
+        assert!(redirect_block_reason("192.168.1.1", true).is_none());
+        assert!(redirect_block_reason("localhost", true).is_none());
+        assert!(redirect_block_reason("169.254.169.254", true).is_some());
+        assert!(redirect_block_reason("0.0.0.0", true).is_some());
     }
 
     #[tokio::test]

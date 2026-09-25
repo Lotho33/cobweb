@@ -275,7 +275,10 @@ impl Tier for BrowserSniffTier {
             Err(e) => return TierOutcome::Failed(e.into()),
         };
 
-        let outcome = match cx.sniff(ctx.url, ctx.url_pattern, ctx.timeout, ctx.interact_js).await {
+        let outcome = match cx
+            .sniff(ctx.url, ctx.url_pattern, ctx.timeout, ctx.interact_js)
+            .await
+        {
             Ok(hit) => {
                 let state = cx.storage_state().await.unwrap_or_default();
                 let kind = StreamKind::from_url(&hit.url).unwrap_or(StreamKind::Hls);

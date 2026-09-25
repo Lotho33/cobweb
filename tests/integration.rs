@@ -528,3 +528,92 @@ async fn ssrf_guard_off_allows_private_targets() {
     assert_eq!(status, 403, "body: {body}");
     assert_eq!(body["kind"], json!("blocked"));
 }
+
+// A redirect to an IP *literal* never reaches the DNS-level SSRF guard (wreq
+// doesn't resolve literals): the redirect policy must refuse it. The metadata
+// address is refused even with allow_private_targets = true, which is what
+// lets this run hermetically against a loopback mock.
+#[tokio::test]
+async fn redirect_to_a_blocked_ip_literal_is_refused() {
+    use std::time::Duration;
+    let app = TestApp::spawn().await;
+    Mock::given(method("GET"))
+        .and(path("/hop"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", "http://169.254.169.254/latest/meta-data/"),
+        )
+        .mount(&app.upstream)
+        .await;
+
+    let url = format!("{}/hop", app.upstream.uri());
+    let fetch = tokio::time::timeout(
+        Duration::from_secs(10),
+        app.post_raw("/v1/fetch", json!({ "url": url })),
+    )
+    .await
+    .expect("/v1/fetch must fail fast, not try to connect to the metadata IP");
+    assert_eq!(fetch.0, 502, "body: {}", String::from_utf8_lossy(&fetch.2));
+    let body = String::from_utf8_lossy(&fetch.2).to_string();
+    assert!(body.contains("refusing redirect"), "body: {body}");
+
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        app.post("/v1/navigate", json!({ "url": url })),
+    )
+    .await
+    .expect("/v1/navigate must fail fast too");
+    assert!(
+        status >= 400,
+        "navigate followed the redirect: {status} {body}"
+    );
+    assert!(
+        body.to_string().contains("refusing redirect"),
+        "body: {body}"
+    );
+}
+
+// The policy must not break ordinary redirects.
+#[tokio::test]
+async fn ordinary_redirects_are_still_followed() {
+    let app = TestApp::spawn().await;
+    Mock::given(method("GET"))
+        .and(path("/old"))
+        .respond_with(
+            ResponseTemplate::new(301)
+                .insert_header("location", format!("{}/new", app.upstream.uri())),
+        )
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/new"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("moved here"))
+        .mount(&app.upstream)
+        .await;
+
+    let (status, _h, body) = app
+        .post_raw(
+            "/v1/fetch",
+            json!({ "url": format!("{}/old", app.upstream.uri()) }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(&body, b"moved here");
+}
+
+// Upstream failures must not echo the URL's query (CDN tokens) back to the
+// caller — nor let wreq append the full URI on its own.
+#[tokio::test]
+async fn upstream_errors_do_not_leak_the_query_string() {
+    let app = TestApp::spawn().await;
+    // Nothing listens here: connection refused → upstream error.
+    let url = "http://127.0.0.1:9/seg.ts?token=SECRET123&exp=1";
+    let (status, _h, body) = app.post_raw("/v1/fetch", json!({ "url": url })).await;
+    let body = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(status, 502, "body: {body}");
+    assert!(!body.contains("SECRET123"), "token leaked: {body}");
+    assert!(
+        body.contains("/seg.ts"),
+        "path should still be there for debugging: {body}"
+    );
+}

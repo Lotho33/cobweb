@@ -136,7 +136,9 @@ impl WreqClient {
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(8)
             .tcp_keepalive(Duration::from_secs(60))
-            .redirect(wreq::redirect::Policy::limited(10));
+            // Redirect hops to IP literals never reach the resolver above:
+            // vetted by the redirect policy instead (see ssrf::redirect_policy).
+            .redirect(crate::ssrf::redirect_policy(self.allow_private_targets));
 
         builder = match kind {
             // Fast path: the caller sets a per-request total timeout and the
@@ -203,7 +205,7 @@ impl FastClient for WreqClient {
         let resp = rb
             .send()
             .await
-            .map_err(|e| CobwebError::Upstream(format!("{} {}: {e}", "GET", req.url)))?;
+            .map_err(|e| crate::util::upstream_error("GET", req.url, e))?;
 
         let status = resp.status().as_u16();
         // wreq's `Response` exposes the final URI (post-redirect) as `uri()`.
@@ -233,7 +235,7 @@ impl FastClient for WreqClient {
             if len as usize > MAX_BODY_BYTES {
                 return Err(CobwebError::Upstream(format!(
                     "body of {} is {len} bytes, over the {MAX_BODY_BYTES}-byte fast-path cap",
-                    req.url
+                    crate::util::redact_url_query(req.url)
                 )));
             }
         }
@@ -243,12 +245,12 @@ impl FastClient for WreqClient {
             _ => Vec::new(),
         };
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| CobwebError::Upstream(format!("read body of {}: {e}", req.url)))?;
+            let chunk =
+                chunk.map_err(|e| crate::util::upstream_error("read body of", req.url, e))?;
             if buf.len() + chunk.len() > MAX_BODY_BYTES {
                 return Err(CobwebError::Upstream(format!(
                     "body of {} exceeded the {MAX_BODY_BYTES}-byte fast-path cap",
-                    req.url
+                    crate::util::redact_url_query(req.url)
                 )));
             }
             buf.extend_from_slice(&chunk);

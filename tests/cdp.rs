@@ -114,7 +114,7 @@ async fn sniffs_a_url_a_page_script_fetches() {
         .mount(&upstream)
         .await;
 
-    let engine = CdpEngine::new(headless_cfg(), 2, 0, false, no_blocklist()); // 0 = no idle reaper
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, true, no_blocklist()); // 0 = no idle reaper
     engine.ensure_ready().await.expect("Chromium should launch");
     let mut cx = engine
         .acquire(ctx_opts().await)
@@ -156,7 +156,7 @@ async fn navigate_returns_post_js_dom() {
         .mount(&upstream)
         .await;
 
-    let engine = CdpEngine::new(headless_cfg(), 2, 0, false, no_blocklist()); // 0 = no idle reaper
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, true, no_blocklist()); // 0 = no idle reaper
     let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
 
     let url = Url::parse(&format!("{}/p", upstream.uri())).unwrap();
@@ -198,7 +198,7 @@ async fn eval_runs_in_an_isolated_world() {
         .mount(&upstream)
         .await;
 
-    let engine = CdpEngine::new(headless_cfg(), 2, 0, false, no_blocklist()); // 0 = no idle reaper
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, true, no_blocklist()); // 0 = no idle reaper
     let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
     let url = Url::parse(&format!("{}/e", upstream.uri())).unwrap();
 
@@ -237,7 +237,7 @@ async fn storage_state_captures_set_cookie() {
         .mount(&upstream)
         .await;
 
-    let engine = CdpEngine::new(headless_cfg(), 2, 0, false, no_blocklist());
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, true, no_blocklist());
     let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
     let url = Url::parse(&format!("{}/set", upstream.uri())).unwrap();
     cx.navigate(
@@ -257,6 +257,81 @@ async fn storage_state_captures_set_cookie() {
     assert_eq!(sess.value, "abc123");
     assert!(sess.expires > 0.0, "Max-Age should give a real expiry");
 
+    cx.close().await;
+    engine.shutdown().await;
+}
+
+// Regression for the browser tier's SSRF guard (Fetch domain): with private
+// targets NOT allowed, navigating to the loopback mock must be refused. The
+// other tests here run with allow_private_targets = true precisely because of
+// this guard — before, they used `false` and silently failed once Chromium
+// was present (and skipped without it).
+#[tokio::test]
+async fn browser_guard_refuses_private_targets() {
+    if !have_chromium() {
+        eprintln!("skip browser_guard_refuses_private_targets: no chromium on PATH");
+        return;
+    }
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/p"))
+        .respond_with(html_page("<html><body>internal</body></html>"))
+        .mount(&upstream)
+        .await;
+
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, false, no_blocklist());
+    let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
+    let url = Url::parse(&format!("{}/p", upstream.uri())).unwrap();
+    let res = cx
+        .navigate(
+            &url,
+            cobweb::browser::WaitFor::Load,
+            Duration::from_secs(15),
+        )
+        .await;
+    assert!(
+        res.is_err() || !res.as_ref().unwrap().html.contains("internal"),
+        "loopback page loaded with the guard on"
+    );
+    cx.close().await;
+    engine.shutdown().await;
+}
+
+// Even when private targets are allowed, a page redirecting to the cloud
+// metadata address must not get there (hard-blocked range).
+#[tokio::test]
+async fn browser_guard_refuses_redirect_to_metadata() {
+    if !have_chromium() {
+        eprintln!("skip browser_guard_refuses_redirect_to_metadata: no chromium on PATH");
+        return;
+    }
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/hop"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", "http://169.254.169.254/latest/meta-data/"),
+        )
+        .mount(&upstream)
+        .await;
+
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, true, no_blocklist());
+    let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
+    let url = Url::parse(&format!("{}/hop", upstream.uri())).unwrap();
+    let res = cx
+        .navigate(
+            &url,
+            cobweb::browser::WaitFor::Load,
+            Duration::from_secs(15),
+        )
+        .await;
+    if let Ok(page) = &res {
+        assert_ne!(
+            page.final_url.host_str(),
+            Some("169.254.169.254"),
+            "browser followed the redirect to the metadata address"
+        );
+    }
     cx.close().await;
     engine.shutdown().await;
 }

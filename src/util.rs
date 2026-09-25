@@ -75,6 +75,19 @@ pub fn redact_url_query(url: &url::Url) -> String {
     u.to_string()
 }
 
+/// An upstream failure as a `CobwebError`, safe to log and to hand back to
+/// the caller: the URL without its query/fragment (CDN tokens, signatures)
+/// and the `wreq` error without the full URI it appends on its own
+/// (`… for uri (<full url>)`). Both used to leak tokens into `error!` logs
+/// and API responses.
+pub fn upstream_error(what: &str, url: &url::Url, e: wreq::Error) -> crate::error::CobwebError {
+    crate::error::CobwebError::Upstream(format!(
+        "{what} {}: {}",
+        redact_url_query(url),
+        e.without_uri()
+    ))
+}
+
 /// A high-entropy random token, hex-encoded (`bytes * 2` hex chars). Reads
 /// `/dev/urandom` directly rather than pulling in a `rand` crate dependency
 /// for the couple of infrequent, human-paced call sites that need one (e.g.
