@@ -34,21 +34,29 @@ fn headers_to_map(headers: &[(String, String)]) -> Value {
 
 // ─── GET /health ────────────────────────────────────────────────────────────
 
-pub async fn health(State(st): State<AppState>) -> Json<HealthResponse> {
-    let jar_domains = st.jar.count().await;
+pub async fn health(State(st): State<AppState>, headers: HeaderMap) -> Json<HealthResponse> {
     let (engine, contexts_in_use) = match &st.browser {
         Some(b) => (b.name().to_string(), b.contexts_in_use()),
         None => ("none".to_string(), 0),
     };
+    let authorized = st.config.server.effective_api_key().is_none()
+        || crate::api::request_has_valid_key(&st, &headers);
+    let details = if authorized {
+        Some(HealthDetails {
+            fast_engine: st.fast.engine().into(),
+            contexts_in_use,
+            jar_domains: st.jar.count().await,
+            egress_profiles: st.egress.names(),
+            uptime_secs: st.uptime().as_secs(),
+        })
+    } else {
+        None
+    };
     Json(HealthResponse {
         ready: true,
         engine,
-        fast_engine: st.fast.engine().into(),
-        contexts_in_use,
-        jar_domains,
-        egress_profiles: st.egress.names(),
-        uptime_secs: st.uptime().as_secs(),
         version: env!("CARGO_PKG_VERSION").into(),
+        details,
     })
 }
 
@@ -196,7 +204,7 @@ pub async fn fetch(
     let egress = st
         .egress
         .resolve(req.egress.as_deref(), req.proxy_url.as_deref())?;
-    crate::ssrf::guard_egress(&egress, st.config.server.allow_private_targets).await?;
+    crate::ssrf::guard_egress(&egress, st.config.server.private_proxy_hosts_ok()).await?;
     st.egress.ensure_available(&egress).await?;
     crate::ssrf::guard_url(
         &url,

@@ -438,7 +438,7 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
     // Vet a caller-supplied `proxy_url` *before* `ensure_available`'s
     // TCP-connect probe, which would otherwise double as a blind port-scan
     // oracle against an internal host named in the request.
-    crate::ssrf::guard_egress(&egress, state.config.server.allow_private_targets).await?;
+    crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
 
     // yt-dlp path: for configured hosts, shell out instead of running the tiers.
@@ -737,7 +737,7 @@ pub async fn navigate_fastpath(
     let egress = state
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
-    crate::ssrf::guard_egress(&egress, state.config.server.allow_private_targets).await?;
+    crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
     crate::ssrf::guard_url(
         &url,
@@ -831,7 +831,7 @@ pub async fn browser_sniff(
     let egress = state
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
-    crate::ssrf::guard_egress(&egress, state.config.server.allow_private_targets).await?;
+    crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
     crate::ssrf::guard_url(
         &trigger,
@@ -896,7 +896,7 @@ pub async fn browser_eval(
     let egress = state
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
-    crate::ssrf::guard_egress(&egress, state.config.server.allow_private_targets).await?;
+    crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
     crate::ssrf::guard_url(
         &url,

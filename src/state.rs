@@ -143,15 +143,16 @@ impl AppState {
                         config.server.allow_private_targets,
                         blocklist.clone(),
                     )
-                    .with_dns_settings(settings.clone()),
+                    .with_dns_settings(settings.clone())
+                    .with_private_proxies(config.server.private_proxy_hosts_ok()),
                 ))
             }
         };
 
-        let fast = Arc::new(WreqClient::new(
-            config.server.allow_private_targets,
-            settings.clone(),
-        ));
+        let fast = Arc::new(
+            WreqClient::new(config.server.allow_private_targets, settings.clone())
+                .with_private_proxies(config.server.allow_private_proxies),
+        );
         Ok(Self::new(
             config, egress, jar, fast, browser, blocklist, settings,
         ))

@@ -81,6 +81,14 @@ pub struct ServerConfig {
     /// rebinding from a web page open on the same host/network.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Let a caller-supplied `proxy_url` point at a private/loopback host
+    /// (e.g. a wireproxy/WARP SOCKS listener on `127.0.0.1` or a Compose
+    /// service name) without relaxing the SSRF guard for *targets*
+    /// (`allow_private_targets`). The metadata address and other hard-blocked
+    /// ranges stay refused. Only meaningful for a trusted caller — pair it
+    /// with `api_key` (or a loopback bind).
+    #[serde(default)]
+    pub allow_private_proxies: bool,
 }
 
 impl Default for ServerConfig {
@@ -93,6 +101,7 @@ impl Default for ServerConfig {
             allow_private_targets: false,
             api_key: None,
             allowed_hosts: Vec::new(),
+            allow_private_proxies: false,
         }
     }
 }
@@ -106,6 +115,12 @@ impl ServerConfig {
             .as_deref()
             .map(str::trim)
             .filter(|k| !k.is_empty())
+    }
+
+    /// Whether a caller-supplied proxy host may be private/loopback — true
+    /// under either `allow_private_targets` or `allow_private_proxies`.
+    pub fn private_proxy_hosts_ok(&self) -> bool {
+        self.allow_private_targets || self.allow_private_proxies
     }
 
     pub fn listen_addr(&self) -> SocketAddr {

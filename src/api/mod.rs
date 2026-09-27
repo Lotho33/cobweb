@@ -81,6 +81,23 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// Does `req` carry the configured API key? (`false` when none is set.)
+pub(crate) fn request_has_valid_key(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    let Some(key) = st.config.server.effective_api_key() else {
+        return false;
+    };
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        })
+        .is_some_and(|p| constant_time_eq(p, key))
+}
+
 /// DNS-rebinding guard for the *unauthenticated* API. A web page the
 /// operator has open can re-point its own domain at `127.0.0.1` (or the
 /// sidecar's LAN IP) and then call cobweb same-origin — no CORS preflight,
@@ -132,9 +149,14 @@ fn host_allowed(host: &str, extra: &[String]) -> bool {
             .map_or(host, |(name, _)| name)
     };
     let name = name.trim_end_matches('.').to_ascii_lowercase();
+    // Special-use names that can never be registered in public DNS, so a
+    // rebinding attacker can't own them: `.localhost` (RFC 6761), `.local`
+    // (mDNS, RFC 6762), `.home.arpa` (RFC 8375) and `.internal` (reserved by
+    // ICANN for private use — e.g. Docker's `host.docker.internal`).
+    const PRIVATE_SUFFIXES: [&str; 4] = [".localhost", ".local", ".home.arpa", ".internal"];
     if name.parse::<std::net::IpAddr>().is_ok()
         || name == "localhost"
-        || name.ends_with(".localhost")
+        || PRIVATE_SUFFIXES.iter().any(|s| name.ends_with(s))
         || (!name.is_empty() && !name.contains('.'))
     {
         return true;
@@ -145,26 +167,12 @@ fn host_allowed(host: &str, extra: &[String]) -> bool {
 }
 
 async fn require_api_key(State(st): State<AppState>, req: Request, next: Next) -> Response {
-    let Some(key) = st.config.server.effective_api_key() else {
-        // No key configured: unauthenticated by operator choice (main.rs warns
-        // loudly at startup if this is paired with a non-loopback bind).
-        return next.run(req).await;
-    };
-
-    let provided = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            req.headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-        });
-
-    match provided {
-        Some(p) if constant_time_eq(p, key) => next.run(req).await,
-        _ => unauthorized(),
+    // No key configured: unauthenticated by operator choice (main.rs warns
+    // loudly at startup if this is paired with a non-loopback bind).
+    if st.config.server.effective_api_key().is_none() || request_has_valid_key(&st, req.headers()) {
+        next.run(req).await
+    } else {
+        unauthorized()
     }
 }
 
@@ -174,7 +182,7 @@ mod tests {
 
     #[test]
     fn host_allowed_accepts_only_non_rebindable_names() {
-        let extra = vec!["cobweb.internal".to_string()];
+        let extra = vec!["cobweb.example.org".to_string()];
         for ok in [
             "127.0.0.1:8191",
             "10.0.0.5",
@@ -183,7 +191,11 @@ mod tests {
             "a.localhost",
             "cobweb:8191",
             "COBWEB",
-            "cobweb.internal:8191",
+            "cobweb.example.org",
+            "cobweb.lan.internal:8191",
+            "host.docker.internal:8191",
+            "nas.local",
+            "box.home.arpa",
         ] {
             assert!(host_allowed(ok, &extra), "{ok} should pass");
         }

@@ -211,15 +211,25 @@ pub struct EvalResponse {
 
 // ─── GET /health ────────────────────────────────────────────────────────────
 
+/// `GET /health`. The fields after `version` are operational detail and are
+/// only returned when no `api_key` is configured or the request carries it:
+/// `/health` itself stays unauthenticated for liveness probes, but egress
+/// profile names and jar/uptime counters are not a probe's business.
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
     pub ready: bool,
     /// Browser engine: `"none"` in M1.
     pub engine: String,
+    pub version: String,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub details: Option<HealthDetails>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthDetails {
     pub fast_engine: String,
     pub contexts_in_use: usize,
     pub jar_domains: usize,
     pub egress_profiles: Vec<String>,
     pub uptime_secs: u64,
-    pub version: String,
 }

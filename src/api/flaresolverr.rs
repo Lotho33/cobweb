@@ -137,7 +137,8 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
         Ok(e) => e,
         Err(e) => return envelope("error", &e.to_string(), started, json!({})),
     };
-    if let Err(e) = crate::ssrf::guard_egress(&egress, st.config.server.allow_private_targets).await
+    if let Err(e) =
+        crate::ssrf::guard_egress(&egress, st.config.server.private_proxy_hosts_ok()).await
     {
         return envelope("error", &e.to_string(), started, json!({}));
     }

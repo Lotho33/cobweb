@@ -702,3 +702,103 @@ async fn named_egress_proxy_on_a_private_host_is_usable() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["html"], "via proxy");
 }
+
+async fn spawn_with(extra_server: &str) -> (String, tempfile::TempDir) {
+    let jar_dir = tempfile::tempdir().unwrap();
+    let cfg = Config::parse(&format!(
+        r#"
+        [server]
+        port = 0
+        browser_engine = "none"
+        {extra_server}
+        [jar]
+        path = {:?}
+        [egress.direct]
+        proxy = ""
+        "#,
+        jar_dir.path()
+    ))
+    .unwrap();
+    let state = AppState::from_config(cfg).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = cobweb::serve_on(state, listener).await;
+    });
+    (format!("http://{addr}"), jar_dir)
+}
+
+// With an api_key, the unauthenticated /health (liveness probes) only says
+// ready/engine/version — mycelium reads exactly those two fields and sends
+// the key anyway, so it still gets the full view.
+#[tokio::test]
+async fn health_hides_operational_detail_without_the_key() {
+    let (base, _d) = spawn_with(r#"api_key = "k-0123456789abcdef0123456789""#).await;
+    let http = wreq::Client::new();
+    let anon: Value = http
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(anon["ready"], true);
+    assert!(anon.get("engine").is_some() && anon.get("version").is_some());
+    assert!(anon.get("egress_profiles").is_none(), "{anon}");
+    let full: Value = http
+        .get(format!("{base}/health"))
+        .header("x-api-key", "k-0123456789abcdef0123456789")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(full["egress_profiles"], json!(["direct"]));
+}
+
+// mycelium hands /v1/fetch a raw `proxy_url` on loopback (wireproxy / WARP
+// sharing its network namespace). `allow_private_proxies` permits that
+// without opening private *targets*; without it the proxy is refused.
+#[tokio::test]
+async fn raw_loopback_proxy_url_needs_allow_private_proxies() {
+    let proxy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/seg.ts"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("SEG"))
+        .mount(&proxy)
+        .await;
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.address().port());
+    let body = json!({ "url": "http://cdn.example.test/seg.ts", "proxy_url": proxy_url });
+    let http = wreq::Client::new();
+
+    let (strict, _d1) = spawn_with("allow_private_targets = false").await;
+    let r = http
+        .post(format!("{strict}/v1/fetch"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+
+    let (relaxed, _d2) =
+        spawn_with("allow_private_targets = false\nallow_private_proxies = true").await;
+    let r = http
+        .post(format!("{relaxed}/v1/fetch"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.text().await.unwrap(), "SEG");
+
+    // ...while private *targets* stay refused on that same instance.
+    let r = http
+        .post(format!("{relaxed}/v1/fetch"))
+        .json(&json!({ "url": format!("http://127.0.0.1:{}/seg.ts", proxy.address().port()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+}

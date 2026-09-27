@@ -269,6 +269,9 @@ fn blocked(host: &str, reason: &str) -> CobwebError {
 /// only a raw `proxy_url` supplied on the request itself — tagged
 /// `"raw:<url>"` by [`crate::egress::Egress::from_raw_proxy`] — is untrusted
 /// input and needs this check.
+///
+/// `allow_private` here is [`crate::config::ServerConfig::private_proxy_hosts_ok`]
+/// (`allow_private_targets` *or* `allow_private_proxies`).
 pub async fn guard_egress(egress: &crate::egress::Egress, allow_private: bool) -> Result<()> {
     if !egress.name.starts_with("raw:") {
         return Ok(()); // operator-configured profile: trusted, operator owns the exit

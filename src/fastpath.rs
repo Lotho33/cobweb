@@ -81,6 +81,9 @@ pub struct WreqClient {
     cache: Mutex<BoundedMap<String, wreq::Client>>,
     /// Passed to the per-client [`crate::ssrf::GuardedResolver`].
     allow_private_targets: bool,
+    /// `[server].allow_private_proxies`: a raw request `proxy_url`'s host may
+    /// be private too (see `with_private_proxies`).
+    private_proxies: bool,
     /// Shared with every cached client's `GuardedResolver` so a live
     /// `[settings].dns_servers` change (`GET/PATCH /v1/settings`) takes
     /// effect immediately, without rebuilding any cached `wreq::Client`.
@@ -106,8 +109,17 @@ impl WreqClient {
         Self {
             cache: Mutex::new(BoundedMap::new(CLIENT_CACHE_CAP)),
             allow_private_targets,
+            private_proxies: false,
             settings,
         }
+    }
+
+    /// Mirror `[server].allow_private_proxies`: also let a caller-supplied
+    /// raw `proxy_url` resolve to a private address (hard-blocked ranges
+    /// still refused).
+    pub fn with_private_proxies(mut self, allow: bool) -> Self {
+        self.private_proxies = allow;
+        self
     }
 
     fn client_for(&self, egress: &Egress, kind: ClientKind) -> Result<wreq::Client> {
@@ -151,7 +163,9 @@ impl WreqClient {
                 // an operator-configured profile's proxy is trusted (see
                 // `GuardedResolver`'s doc), a raw request `proxy_url` is not.
                 match egress.proxy.as_ref().and_then(|p| p.host_str()) {
-                    Some(h) if !egress.name.starts_with("raw:") => r.trusting_proxy_host(h),
+                    Some(h) if !egress.name.starts_with("raw:") || self.private_proxies => {
+                        r.trusting_proxy_host(h)
+                    }
                     _ => r,
                 }
             })

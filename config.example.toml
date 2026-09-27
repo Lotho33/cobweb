@@ -21,6 +21,12 @@ max_contexts = 2          # concurrent browser contexts; requests beyond this qu
 # firewall's job. 169.254.169.254 and a few always-bogus ranges stay blocked
 # either way.
 allow_private_targets = false
+# Let a request's raw `proxy_url` point at a private/loopback host (e.g. a
+# wireproxy/WARP SOCKS listener on 127.0.0.1, or a Compose service name)
+# WITHOUT opening private targets. Hard-blocked ranges (169.254.169.254, …)
+# stay refused. Only for a trusted caller — use with api_key or a loopback bind.
+# ([egress.*] profiles below are operator config and never need this.)
+allow_private_proxies = false
 # Shared secret required on every request (Authorization: Bearer <key>, or
 # X-Api-Key: <key>) except GET /health.
 # Unset (the default) => the API is UNAUTHENTICATED; cobweb warns loudly at
@@ -29,8 +35,9 @@ allow_private_targets = false
 # api_key = "change-me-to-a-long-random-value"
 # DNS-rebinding guard, active only while api_key is unset: requests whose Host
 # header is not an IP literal, `localhost`, a single-label name (a container
-# service name such as `cobweb`) or one of these are refused with 421. Add the
-# name(s) you reach cobweb by if they contain a dot.
+# service name such as `cobweb`), a special-use name (*.internal — e.g.
+# host.docker.internal —, *.local, *.home.arpa) or one of these are refused
+# with 421. Add the name(s) you reach cobweb by if they don't fit the above.
 # allowed_hosts = ["cobweb.internal"]
 # Tokio worker threads: env COBWEB_WORKER_THREADS (default 2). A sidecar rarely
 # needs more; raise it only if you drive many concurrent /v1/fetch streams.

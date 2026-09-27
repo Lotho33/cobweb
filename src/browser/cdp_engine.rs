@@ -117,6 +117,9 @@ pub struct CdpEngine {
     /// Live `[settings].dns_servers` for that proxy's lookups; `None` =
     /// system resolver.
     dns_settings: Option<Arc<crate::settings::RuntimeSettings>>,
+    /// `ServerConfig::private_proxy_hosts_ok` — for pinning a raw
+    /// `proxy_url`'s host (see `acquire`).
+    private_proxies: bool,
 }
 
 struct Launched {
@@ -148,7 +151,15 @@ impl CdpEngine {
             blocklist,
             egress_proxy: tokio::sync::OnceCell::new(),
             dns_settings: None,
+            private_proxies: allow_private_targets,
         }
+    }
+
+    /// Whether a caller-supplied raw `proxy_url` may resolve to a private
+    /// host (`ServerConfig::private_proxy_hosts_ok`).
+    pub fn with_private_proxies(mut self, allow: bool) -> Self {
+        self.private_proxies = allow;
+        self
     }
 
     /// Resolve browser egress through the live `[settings].dns_servers`
@@ -293,6 +304,9 @@ impl BrowserEngine for CdpEngine {
         // localhost/loopback targets; this removes that exception so they
         // ride the proxy (and its checks) like everything else.
         let proxy_server = match opts.egress.proxy.as_ref() {
+            Some(p) if opts.egress.name.starts_with("raw:") => {
+                pinned_proxy_server(p, self.private_proxies, self.dns_settings.as_deref()).await?
+            }
             Some(p) => p.as_str().trim_end_matches('/').to_string(),
             None => self
                 .egress_proxy
@@ -1280,6 +1294,26 @@ fn fetch_guard_decision(
         }
     }
     FetchDecision::Allow
+}
+
+/// A caller-supplied raw proxy URL with its host replaced by the address it
+/// was vetted to. `ssrf::guard_egress` checked the name earlier, but Chromium
+/// would resolve it again on its own — a rebinding record could flip it to
+/// an internal address in between. Pinning the vetted IP closes that.
+async fn pinned_proxy_server(
+    proxy: &Url,
+    allow_private: bool,
+    settings: Option<&crate::settings::RuntimeSettings>,
+) -> BrowserResult<String> {
+    let host = proxy.host_str().unwrap_or_default();
+    let port = proxy.port_or_known_default().unwrap_or(1080);
+    let addrs = crate::ssrf::vetted_socket_addrs(host, port, allow_private, settings)
+        .await
+        .map_err(|e| BrowserError::Unavailable(format!("proxy_url refused: {e}")))?;
+    let ip = addrs[0].ip();
+    let mut pinned = proxy.clone();
+    let _ = pinned.set_ip_host(ip);
+    Ok(pinned.as_str().trim_end_matches('/').to_string())
 }
 
 /// `Target.setAutoAttach` params used for the page and, recursively, every
