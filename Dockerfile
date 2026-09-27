@@ -47,5 +47,9 @@ RUN useradd -m -u 10001 cobweb && mkdir -p /data && chown cobweb /data
 USER cobweb
 
 ENV COBWEB_CONFIG=/config/config.toml
+# glibc gives each thread that allocates its own malloc arena; on a
+# long-running multi-threaded process that mostly shows up as RSS that never
+# shrinks. Two arenas are plenty for a sidecar with 2 worker threads.
+ENV MALLOC_ARENA_MAX=2
 EXPOSE 8191
 ENTRYPOINT ["tini", "--", "cobweb"]

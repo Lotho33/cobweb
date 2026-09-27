@@ -11,8 +11,8 @@ pub use cookie::{Cookie, LocalStorageEntry, OriginState, StorageState};
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -120,7 +120,15 @@ pub struct Jar {
     /// Set once the jar dir is known to exist, so every write doesn't re-run
     /// `create_dir_all`.
     dir_ready: AtomicBool,
+    /// `count()` result + when it was taken. `/health` is polled by liveness
+    /// probes every few seconds and used to `read_dir` the whole jar each
+    /// time; invalidated by every write/delete made through this `Jar`.
+    count_cache: StdMutex<Option<(usize, Instant)>>,
 }
+
+/// How long a cached [`Jar::count`] stays valid (covers files added or
+/// removed behind the process's back).
+const COUNT_CACHE_TTL: Duration = Duration::from_secs(10);
 
 impl Jar {
     pub fn new(root: impl Into<PathBuf>, default_ttl: Duration, fail_streak_limit: u32) -> Self {
@@ -130,7 +138,12 @@ impl Jar {
             fail_streak_limit: AtomicU32::new(fail_streak_limit.max(1)),
             write_lock: Mutex::new(()),
             dir_ready: AtomicBool::new(false),
+            count_cache: StdMutex::new(None),
         }
+    }
+
+    fn invalidate_count(&self) {
+        *self.count_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub fn default_ttl(&self) -> Duration {
@@ -151,6 +164,15 @@ impl Jar {
 
     pub async fn ensure_dir(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.root).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                tokio::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700)).await
+            {
+                tracing::warn!(path = %self.root.display(), error = %e, "jar: could not restrict directory permissions");
+            }
+        }
         self.dir_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -196,37 +218,21 @@ impl Jar {
             self.ensure_dir().await?;
         }
         let path = self.file_for(&entry.domain, &entry.egress);
-        let tmp = path.with_extension("json.tmp");
+        self.invalidate_count();
         let json = serde_json::to_vec_pretty(entry)
             .map_err(|e| CobwebError::Other(anyhow::anyhow!("serialise jar entry: {e}")))?;
-        tokio::fs::write(&tmp, &json).await.map_err(|e| {
-            CobwebError::Other(anyhow::anyhow!(
-                "jar write {}/{}: {e}",
-                entry.domain,
-                entry.egress
-            ))
-        })?;
         // The jar holds live session cookies (cf_clearance and friends) in
-        // plaintext; restrict the file to the owner so another local
-        // user/process sharing the host or a volume can't read them off disk.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await
-            {
-                tracing::warn!(path = %tmp.display(), error = %e, "jar: could not restrict file permissions");
-            }
-        }
-        // Atomic replace so a concurrent reader never sees a half-written file.
-        tokio::fs::rename(&tmp, &path).await.map_err(|e| {
-            CobwebError::Other(anyhow::anyhow!(
-                "jar rename {}/{}: {e}",
-                entry.domain,
-                entry.egress
-            ))
-        })?;
-        Ok(())
+        // plaintext: created 0600 from the start and replaced atomically so
+        // a concurrent reader never sees a half-written file.
+        crate::util::write_private_atomic(&path, json)
+            .await
+            .map_err(|e| {
+                CobwebError::Other(anyhow::anyhow!(
+                    "jar write {}/{}: {e}",
+                    entry.domain,
+                    entry.egress
+                ))
+            })
     }
 
     /// `now > created + ttl_hint_secs` OR the fail streak has hit the limit.
@@ -296,6 +302,7 @@ impl Jar {
     pub async fn delete(&self, domain: &str, egress_key: &str) -> Result<bool> {
         let _g = self.write_lock.lock().await;
         let path = self.file_for(domain, egress_key);
+        self.invalidate_count();
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -344,6 +351,17 @@ impl Jar {
     /// hot `/health` and `/metrics` counters (`list()` reads and parses every
     /// file and is only for `GET /v1/jar`).
     pub async fn count(&self) -> usize {
+        if let Some((n, at)) = *self.count_cache.lock().unwrap_or_else(|e| e.into_inner()) {
+            if at.elapsed() < COUNT_CACHE_TTL {
+                return n;
+            }
+        }
+        let n = self.count_uncached().await;
+        *self.count_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((n, Instant::now()));
+        n
+    }
+
+    async fn count_uncached(&self) -> usize {
         let mut rd = match tokio::fs::read_dir(&self.root).await {
             Ok(rd) => rd,
             Err(_) => return 0,

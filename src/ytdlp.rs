@@ -78,7 +78,8 @@ impl Ytdlp {
         if let Some(f) = &cookie_file {
             cmd.arg("--cookies").arg(&f.0);
         }
-        cmd.arg(url.as_str());
+        // `--` so nothing in the URL can ever be read as an option.
+        cmd.arg("--").arg(url.as_str());
 
         let out = tokio::time::timeout(timeout, cmd.output())
             .await
@@ -111,21 +112,28 @@ impl Ytdlp {
 struct TempCookies(PathBuf);
 
 impl TempCookies {
+    /// Created `0600` + `create_new` under an unguessable name: never
+    /// follows a symlink planted in the shared temp dir, and never briefly
+    /// world-readable (it used to be written with the default umask and
+    /// `chmod`ed afterwards).
     fn write(contents: &str) -> Result<Self> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path =
-            std::env::temp_dir().join(format!("cobweb-cookies-{}-{nanos}.txt", std::process::id()));
-        std::fs::write(&path, contents)
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "cobweb-cookies-{}-{}.txt",
+            std::process::id(),
+            crate::util::random_token(8)
+        ));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
             .map_err(|e| CobwebError::Other(anyhow::anyhow!("write cookies: {e}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(Self(path))
+        let guard = Self(path);
+        f.write_all(contents.as_bytes())
+            .map_err(|e| CobwebError::Other(anyhow::anyhow!("write cookies: {e}")))?;
+        Ok(guard)
     }
 }
 

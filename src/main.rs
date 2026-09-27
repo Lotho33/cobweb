@@ -37,6 +37,11 @@ fn main() -> ExitCode {
         .unwrap_or(2);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
+        // The blocking pool serves getaddrinfo (SSRF guard / browser guard
+        // DNS checks) and file I/O. Tokio's default ceiling is 512 threads;
+        // a burst of slow lookups on a page with many hosts could grow that
+        // far (each with its own stack). 64 is ample for a sidecar.
+        .max_blocking_threads(64)
         .enable_all()
         .build()
         .expect("build tokio runtime");
@@ -119,13 +124,20 @@ async fn run() -> ExitCode {
     // there's nothing enabled yet, so they always run rather than being
     // gated on a config flag: enabling the blocklist later via the API
     // doesn't need a restart to pick up the periodic refresh.
-    state.blocklist.refresh(&state.fast).await;
-    tokio::spawn(
-        state
-            .blocklist
-            .clone()
-            .spawn_refresh_loop(state.fast.clone()),
-    );
+    //
+    // Backgrounded: the initial refresh fetches every enabled source (up to
+    // 30 s each) and used to run *before* the listener was bound — health
+    // probes failed and restarts stalled for the whole round. The persisted
+    // domains from the last run are already loaded, so nothing is unblocked
+    // in the meantime.
+    {
+        let blocklist = state.blocklist.clone();
+        let fast = state.fast.clone();
+        tokio::spawn(async move {
+            blocklist.refresh(&fast).await;
+            blocklist.spawn_refresh_loop(fast).await;
+        });
+    }
 
     if state.config.browser.prewarm {
         if let Some(b) = &state.browser {

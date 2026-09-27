@@ -137,7 +137,13 @@ pub fn random_token(bytes: usize) -> String {
             *b = ((nanos >> ((i % 16) * 8)) & 0xff) as u8;
         }
     }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes * 2);
+    for b in buf {
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 0xf)] as char);
+    }
+    out
 }
 
 /// Constant-time byte comparison for secrets compared against untrusted
@@ -156,29 +162,56 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Atomic write-tmp-then-rename + `chmod 0600` for a small persisted JSON
-/// document — the pattern `Jar::save_locked` (`src/jar/mod.rs`),
-/// [`crate::blocklist::Blocklist`], and [`crate::settings::RuntimeSettings`]
-/// all use for their own state, so a concurrent reader never sees a
-/// half-written file and the contents aren't world-readable.
+/// Atomic write of a private file: a uniquely-named sibling temp file is
+/// created `0600` from the start (`create_new`, so never a pre-existing file
+/// or symlink), written, `fsync`ed and renamed over `path`. The pattern the
+/// jar, [`crate::blocklist::Blocklist`] and [`crate::settings::RuntimeSettings`]
+/// share. It replaces a fixed `<name>.json.tmp` written with the default
+/// umask and `chmod`ed afterwards: that left a window where live cookies were
+/// world-readable, let two concurrent writers truncate each other's temp
+/// file, and could leave an empty file behind on a crash (no fsync).
+pub async fn write_private_atomic(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "state".into());
+        let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", random_token(6)));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let result = (|| {
+            let mut f = opts.open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// Persist `value` as compact JSON via [`write_private_atomic`], creating
+/// the parent directory if needed. Compact rather than pretty: the blocklist
+/// state carries every source's full domain list (100k+ entries), rewritten
+/// on each admin toggle.
 pub async fn persist_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_vec_pretty(value)
+    let json = serde_json::to_vec(value)
         .map_err(|e| CobwebError::Other(anyhow::anyhow!("serialise {}: {e}", path.display())))?;
-    tokio::fs::write(&tmp, &json).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) =
-            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await
-        {
-            tracing::warn!(path = %tmp.display(), error = %e, "could not restrict state file permissions");
-        }
-    }
-    tokio::fs::rename(&tmp, path).await?;
+    write_private_atomic(path, json).await?;
     Ok(())
 }
 
@@ -322,6 +355,22 @@ mod tests {
         let r = redact_url_query(&u);
         assert_eq!(r, "https://cdn.example.com/hls/master.m3u8");
         assert!(!r.contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn write_private_atomic_is_0600_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.json");
+        write_private_atomic(&p, b"one".to_vec()).await.unwrap();
+        write_private_atomic(&p, b"two".to_vec()).await.unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

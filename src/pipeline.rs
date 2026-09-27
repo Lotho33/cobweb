@@ -371,7 +371,25 @@ fn pattern_ok(set: &GlobSet, u: &Url) -> bool {
     set.is_match(path) || set.is_match(file) || set.is_match(u.as_str())
 }
 
+/// Caps on caller-supplied `url_pattern`s: each one is compiled into a
+/// regex per request, so an unbounded list (the body limit alone allows MBs)
+/// is a cheap CPU-burn lever.
+const MAX_PATTERNS: usize = 32;
+const MAX_PATTERN_LEN: usize = 512;
+
 pub fn build_globset(patterns: &[String]) -> Result<GlobSet> {
+    if patterns.len() > MAX_PATTERNS {
+        return Err(CobwebError::BadRequest(format!(
+            "too many url_pattern entries ({} > {MAX_PATTERNS})",
+            patterns.len()
+        )));
+    }
+    if let Some(p) = patterns.iter().find(|p| p.len() > MAX_PATTERN_LEN) {
+        return Err(CobwebError::BadRequest(format!(
+            "url_pattern longer than {MAX_PATTERN_LEN} bytes: {}…",
+            p.chars().take(40).collect::<String>()
+        )));
+    }
     let mut b = GlobSetBuilder::new();
     for p in patterns {
         let g = Glob::new(p)
@@ -400,11 +418,14 @@ pub fn registrable_domain(url: &Url) -> Result<String> {
 
 /// Run the pipeline (DESIGN.md §2) and record the outcome for `/metrics`.
 pub async fn resolve(state: &AppState, params: ResolveParams) -> Result<ResolveOutcome> {
+    // Computed up front so errors are attributed to their domain too (they
+    // all used to land on a single `"unknown"` label).
+    let domain = registrable_domain(&params.url).unwrap_or_else(|_| "unknown".into());
     let r = resolve_inner(state, params).await;
     match &r {
         Ok(o) => state.metrics.resolve_ok(&o.domain, o.via_tier),
         Err(CobwebError::NeedsManualSolve { domain }) => state.metrics.resolve_needs_manual(domain),
-        Err(_) => state.metrics.resolve_error("unknown"),
+        Err(_) => state.metrics.resolve_error(&domain),
     }
     r
 }
@@ -937,6 +958,13 @@ mod tests {
     fn registrable_domain_keeps_ip_literal() {
         let u = Url::parse("http://192.168.1.10:8080/x").unwrap();
         assert_eq!(registrable_domain(&u).unwrap(), "192.168.1.10");
+    }
+
+    #[test]
+    fn build_globset_rejects_oversized_input() {
+        let many: Vec<String> = (0..=MAX_PATTERNS).map(|i| format!("*{i}.m3u8")).collect();
+        assert!(build_globset(&many).is_err());
+        assert!(build_globset(&["*".repeat(MAX_PATTERN_LEN + 1)]).is_err());
     }
 
     #[test]
