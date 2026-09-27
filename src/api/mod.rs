@@ -57,7 +57,8 @@ pub fn router(state: AppState) -> Router {
 
     let app = Router::new()
         .route("/health", get(native::health))
-        .merge(protected);
+        .merge(protected)
+        .layer(middleware::from_fn_with_state(state.clone(), check_host));
 
     app.layer(RequestBodyLimitLayer::new(body_limit))
         .layer(TraceLayer::new_for_http())
@@ -78,6 +79,69 @@ fn unauthorized() -> Response {
         })),
     )
         .into_response()
+}
+
+/// DNS-rebinding guard for the *unauthenticated* API. A web page the
+/// operator has open can re-point its own domain at `127.0.0.1` (or the
+/// sidecar's LAN IP) and then call cobweb same-origin — no CORS preflight,
+/// full access to `/v1/eval`, the jar, etc. Such a request necessarily
+/// carries the attacker's domain in `Host`, so while no `api_key` is set,
+/// only Hosts that can't be an attacker-registered name are accepted: an IP
+/// literal, `localhost`/`*.localhost`, a single-label name (Docker/Compose
+/// service names) or an explicit `[server].allowed_hosts` entry. With an
+/// `api_key` the rebinding page has no key, so this check is skipped.
+async fn check_host(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    if st.config.server.effective_api_key().is_some() {
+        return next.run(req).await;
+    }
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().host());
+    match host {
+        // No Host at all: not a browser (they always send one).
+        None => next.run(req).await,
+        Some(h) if host_allowed(h, &st.config.server.allowed_hosts) => next.run(req).await,
+        Some(h) => {
+            tracing::warn!(host = %h, "refusing request with an unexpected Host header (DNS rebinding guard; see [server].allowed_hosts)");
+            (
+                StatusCode::MISDIRECTED_REQUEST,
+                axum::Json(json!({
+                    "error": "unexpected Host header; add it to [server].allowed_hosts or set [server].api_key",
+                    "kind": "bad_host",
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// See [`check_host`]. `host` is a raw `Host` header value (`name[:port]`,
+/// `[v6]:port`).
+fn host_allowed(host: &str, extra: &[String]) -> bool {
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // [v6]:port
+        return rest
+            .split(']')
+            .next()
+            .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok());
+    } else {
+        host.rsplit_once(':')
+            .filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit()))
+            .map_or(host, |(name, _)| name)
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.parse::<std::net::IpAddr>().is_ok()
+        || name == "localhost"
+        || name.ends_with(".localhost")
+        || (!name.is_empty() && !name.contains('.'))
+    {
+        return true;
+    }
+    extra
+        .iter()
+        .any(|a| a.trim().trim_end_matches('.').eq_ignore_ascii_case(&name))
 }
 
 async fn require_api_key(State(st): State<AppState>, req: Request, next: Next) -> Response {
@@ -107,6 +171,31 @@ async fn require_api_key(State(st): State<AppState>, req: Request, next: Next) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_allowed_accepts_only_non_rebindable_names() {
+        let extra = vec!["cobweb.internal".to_string()];
+        for ok in [
+            "127.0.0.1:8191",
+            "10.0.0.5",
+            "[::1]:8191",
+            "localhost:8191",
+            "a.localhost",
+            "cobweb:8191",
+            "COBWEB",
+            "cobweb.internal:8191",
+        ] {
+            assert!(host_allowed(ok, &extra), "{ok} should pass");
+        }
+        for bad in [
+            "evil.example.com",
+            "evil.example.com:8191",
+            "127.0.0.1.nip.io",
+            "[evil]:1",
+        ] {
+            assert!(!host_allowed(bad, &extra), "{bad} should be refused");
+        }
+    }
 
     #[test]
     fn constant_time_eq_matches_str_eq_semantics() {

@@ -27,6 +27,11 @@ allow_private_targets = false
 # startup if that's combined with a non-loopback `bind`. Set this to a long
 # random value before exposing cobweb to anything but 127.0.0.1.
 # api_key = "change-me-to-a-long-random-value"
+# DNS-rebinding guard, active only while api_key is unset: requests whose Host
+# header is not an IP literal, `localhost`, a single-label name (a container
+# service name such as `cobweb`) or one of these are refused with 421. Add the
+# name(s) you reach cobweb by if they contain a dot.
+# allowed_hosts = ["cobweb.internal"]
 # Tokio worker threads: env COBWEB_WORKER_THREADS (default 2). A sidecar rarely
 # needs more; raise it only if you drive many concurrent /v1/fetch streams.
 

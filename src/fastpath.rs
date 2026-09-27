@@ -295,14 +295,23 @@ impl FastClient for WreqClient {
 // Set-Cookie parsing (enough for cf_clearance ttl extraction, not RFC-complete)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Parse one `Set-Cookie` for a response from `request_url`. `None` for a
+/// malformed cookie, or (RFC 6265 §5.3) one whose `Domain` attribute doesn't
+/// cover the responding host or is a public suffix — a site must not be able
+/// to plant cookies for someone else's domain in the jar.
 pub fn parse_set_cookie(header: &str, request_url: &Url) -> Option<Cookie> {
     let mut parts = header.split(';');
     let first = parts.next()?.trim();
     let (name, value) = first.split_once('=')?;
+    let host = request_url
+        .host_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let mut c = Cookie::new(name.trim(), value.trim(), "");
-    c.domain = request_url.host_str().unwrap_or_default().to_string();
+    c.domain = host.clone();
 
     let mut max_age: Option<i64> = None;
+    let mut expires: Option<f64> = None;
     for attr in parts {
         let attr = attr.trim();
         let (k, v) = match attr.split_once('=') {
@@ -310,21 +319,49 @@ pub fn parse_set_cookie(header: &str, request_url: &Url) -> Option<Cookie> {
             None => (attr.to_ascii_lowercase(), String::new()),
         };
         match k.as_str() {
-            "domain" if !v.is_empty() => c.domain = v.trim_start_matches('.').to_string(),
+            "domain" if !v.is_empty() => {
+                let d = v.trim_start_matches('.').to_ascii_lowercase();
+                let covers_host = host == d || host.ends_with(&format!(".{d}"));
+                let is_public_suffix = psl::suffix_str(&d) == Some(d.as_str());
+                if !covers_host || is_public_suffix {
+                    return None;
+                }
+                c.domain = d;
+            }
             "path" if !v.is_empty() => c.path = v,
             "secure" => c.secure = true,
             "httponly" => c.http_only = true,
             "samesite" if !v.is_empty() => c.same_site = Some(v),
             "max-age" => max_age = v.parse().ok(),
+            "expires" => expires = parse_cookie_date(&v),
             _ => {}
         }
     }
 
+    // Max-Age wins over Expires (RFC 6265 §5.3 step 3). Expires used to be
+    // ignored outright, so such a cookie was treated as a never-expiring
+    // session cookie.
     if let Some(secs) = max_age {
         let now = chrono::Utc::now().timestamp() as f64;
         c.expires = if secs <= 0 { 1.0 } else { now + secs as f64 };
+    } else if let Some(at) = expires {
+        c.expires = at.max(1.0);
     }
     Some(c)
+}
+
+/// The common `Expires` date shapes: RFC 1123 (`Wed, 21 Oct 2015 07:28:00
+/// GMT`) and the Netscape dashed form (`Wed, 21-Oct-2015 07:28:00 GMT`).
+fn parse_cookie_date(v: &str) -> Option<f64> {
+    let v = v.trim();
+    chrono::DateTime::parse_from_rfc2822(v)
+        .map(|d| d.timestamp())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(v, "%a, %d-%b-%Y %H:%M:%S GMT")
+                .map(|d| d.and_utc().timestamp())
+        })
+        .ok()
+        .map(|t| t as f64)
 }
 
 /// `Max-Age` of a named cookie among a batch, as a TTL hint in seconds.
@@ -514,6 +551,30 @@ mod tests {
             "<html>normal page</html>",
             Some("nginx")
         ));
+    }
+
+    #[test]
+    fn set_cookie_for_a_foreign_domain_or_public_suffix_is_rejected() {
+        let url = Url::parse("https://evil.example.net/").unwrap();
+        assert!(parse_set_cookie("a=1; Domain=victim.com", &url).is_none());
+        assert!(parse_set_cookie("a=1; Domain=net", &url).is_none());
+        let ok = parse_set_cookie("a=1; Domain=.example.net", &url).unwrap();
+        assert_eq!(ok.domain, "example.net");
+    }
+
+    #[test]
+    fn set_cookie_expires_is_honoured_and_max_age_wins() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let c = parse_set_cookie("a=1; Expires=Wed, 21 Oct 2015 07:28:00 GMT", &url).unwrap();
+        assert_eq!(c.expires, 1445412480.0);
+        let c = parse_set_cookie("a=1; expires=Wed, 21-Oct-2015 07:28:00 GMT", &url).unwrap();
+        assert_eq!(c.expires, 1445412480.0);
+        let c = parse_set_cookie(
+            "a=1; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Max-Age=100",
+            &url,
+        )
+        .unwrap();
+        assert!(c.expires > 1445412480.0);
     }
 
     #[test]

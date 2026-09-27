@@ -617,3 +617,35 @@ async fn upstream_errors_do_not_leak_the_query_string() {
         "path should still be there for debugging: {body}"
     );
 }
+
+// DNS-rebinding guard: with no api_key, a request carrying a foreign
+// registrable-looking Host (what a rebinding page necessarily sends) is
+// refused, while IP/localhost/service-name Hosts keep working.
+#[tokio::test]
+async fn foreign_host_header_is_refused_without_an_api_key() {
+    let app = TestApp::spawn().await;
+    let get = |host: &'static str| {
+        app.http
+            .get(format!("{}/v1/jar", app.base))
+            .header("host", host)
+            .send()
+    };
+    assert_eq!(
+        get("attacker.example.com:8191")
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        421
+    );
+    assert_eq!(get("localhost:8191").await.unwrap().status().as_u16(), 200);
+    assert_eq!(get("cobweb:8191").await.unwrap().status().as_u16(), 200);
+    // Default Host (127.0.0.1:<port>) — every other test relies on this.
+    let ok = app
+        .http
+        .get(format!("{}/v1/jar", app.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+}

@@ -225,10 +225,7 @@ pub async fn fetch(
         if let Ok(domain) = pipeline::registrable_domain(&url) {
             let now = chrono::Utc::now().timestamp() as f64;
             if let Some(j) = st.jar.get_fresh(&domain, &egress).await {
-                if let Some(ch) = j
-                    .storage_state
-                    .cookie_header(url.host_str().unwrap_or(""), now)
-                {
+                if let Some(ch) = j.storage_state.cookie_header(&url, now) {
                     rb = rb.header("cookie", ch);
                 }
             }

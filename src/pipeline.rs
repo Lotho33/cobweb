@@ -170,10 +170,9 @@ impl Tier for FastPathTier {
 
     async fn try_resolve(&self, ctx: &ResolveCtx<'_>) -> TierOutcome {
         let now = chrono::Utc::now().timestamp() as f64;
-        let cookie_header = ctx.jar.and_then(|j| {
-            j.storage_state
-                .cookie_header(ctx.url.host_str().unwrap_or(""), now)
-        });
+        let cookie_header = ctx
+            .jar
+            .and_then(|j| j.storage_state.cookie_header(ctx.url, now));
         let ua = ctx
             .jar
             .map(|j| j.user_agent.as_str())
@@ -335,7 +334,7 @@ fn browser_replay_headers(hit: &SniffHit, state: &StorageState) -> Vec<(String, 
     }
 
     let now = chrono::Utc::now().timestamp() as f64;
-    if let Some(ch) = state.cookie_header(hit.url.host_str().unwrap_or(""), now) {
+    if let Some(ch) = state.cookie_header(&hit.url, now) {
         h.retain(|(k, _)| k != "cookie");
         h.push(("cookie".to_string(), ch));
     }
@@ -355,7 +354,7 @@ fn replay_headers(ctx: &ResolveCtx<'_>, state: &StorageState) -> Vec<(String, St
     }
     h.push(("referer".to_string(), ctx.url.to_string()));
     let now = chrono::Utc::now().timestamp() as f64;
-    if let Some(ch) = state.cookie_header(ctx.url.host_str().unwrap_or(""), now) {
+    if let Some(ch) = state.cookie_header(ctx.url, now) {
         h.push(("cookie".to_string(), ch));
     }
     h
@@ -728,10 +727,9 @@ pub async fn navigate_fastpath(
     let jar = state.jar.get_fresh(&domain, &egress).await;
 
     let now = chrono::Utc::now().timestamp() as f64;
-    let cookie_header = jar.as_ref().and_then(|j| {
-        j.storage_state
-            .cookie_header(url.host_str().unwrap_or(""), now)
-    });
+    let cookie_header = jar
+        .as_ref()
+        .and_then(|j| j.storage_state.cookie_header(&url, now));
     let ua = jar
         .as_ref()
         .map(|j| j.user_agent.as_str())

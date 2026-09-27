@@ -75,6 +75,12 @@ pub struct ServerConfig {
     /// with a non-loopback bind.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Extra `Host` names accepted while `api_key` is unset (see
+    /// `api::check_host`): IP literals, `localhost` and single-label names
+    /// are always accepted. Guards the unauthenticated API against DNS
+    /// rebinding from a web page open on the same host/network.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -86,6 +92,7 @@ impl Default for ServerConfig {
             max_contexts: default_max_contexts(),
             allow_private_targets: false,
             api_key: None,
+            allowed_hosts: Vec::new(),
         }
     }
 }
