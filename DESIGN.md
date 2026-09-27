@@ -183,7 +183,7 @@ site-specific closure poking, a non-goal.)
 **cobweb's decision.** The tier-3 sniff *never calls `evaluate()`* — it navigates
 and watches `Fetch`/`Network` for a `*.m3u8` match. So the leak is entirely
 avoidable by not using the offending path. cobweb ships a **small hand-rolled CDP
-client** (`browser/cdp.rs`, ~400–600 LOC over `tokio-tungstenite`:
+client** (`browser/cdp.rs`, ~400–600 LOC over `--remote-debugging-pipe` — no DevTools TCP port:
 request/response by `id`, events by `method`) covering the ~10 methods the sniff
 needs, plus `Page.createIsolatedWorld` eval for `/v1/eval` and `/v1/navigate`.
 It is the *smaller* dependency, keeps the hot path fully under our control, and
@@ -415,7 +415,7 @@ cobweb/
     ├── browser/
     │   ├── mod.rs            ← BrowserPool, lazy launch, idle shutdown
     │   ├── engine.rs         ← BrowserEngine / BrowserContext traits (the swap seam, §3/§8)
-    │   ├── cdp.rs            ← hand-rolled CDP client over tokio-tungstenite;
+    │   ├── cdp.rs            ← hand-rolled CDP client over --remote-debugging-pipe;
     │   │                        no Runtime.enable; isolated-world eval — the ONLY engine
     │   │                        (a chromiumoxide fallback was evaluated, never built; see §3)
     │   ├── context.rs        ← ContextGuard (Drop = save storage_state + close)
@@ -438,7 +438,6 @@ cobweb/
 | `tokio` | async runtime |
 | `axum` + `tower-http` | HTTP server, middleware (auth passthrough, tracing, limits) |
 | `wreq` + `wreq-util` | HTTP client with **browser TLS/HTTP2 impersonation**; the tier-2 engine, behind the `FastClient` trait. Maintained successor of `rquest` / `reqwest-impersonate` (v0.16 / v0.2 as of 2026-08). TLS backend is `btls` (BoringSSL) built from source → **build needs `cmake` + `clang`**. `impit` (Apify) is the named fallback. |
-| `tokio-tungstenite` | transport for the hand-rolled **CDP client** (§3) |
 | `serde` / `serde_json` / `toml` | config + DTOs + jar files |
 | `url` | egress + target URL parsing |
 | `tracing` / `tracing-subscriber` | structured logs |
