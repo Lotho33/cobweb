@@ -5,6 +5,7 @@
 pub mod cdp;
 pub mod cdp_engine;
 pub mod chromium;
+pub mod egress_proxy;
 pub mod engine;
 
 /// In-memory engine for tests. Public so `tests/` can reach it; not part of the

@@ -17,12 +17,12 @@ use url::Url;
 
 use super::cdp::CdpClient;
 use super::chromium::Chromium;
+use super::egress_proxy::EgressProxy;
 use super::engine::*;
 use crate::blocklist::Blocklist;
 use crate::config::BrowserConfig;
 use crate::fastpath::looks_like_cloudflare_challenge;
 use crate::jar::{Cookie, StorageState};
-use crate::util::BoundedMap;
 
 const STEALTH_JS: &str = r#"
 Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -111,9 +111,12 @@ pub struct CdpEngine {
     /// Tracker/ad domains from `[blocklist]` — enforced by the per-context
     /// guard task when a context's `block_trackers` is set.
     blocklist: Arc<Blocklist>,
-    /// Short-lived cache of the guard's DNS verdicts, shared by every context
-    /// (see [`DnsVerdictCache`]).
-    dns_cache: DnsVerdictCache,
+    /// Connect-time SSRF proxy every `direct`-egress context rides (see
+    /// `browser/egress_proxy.rs`). Started on first use.
+    egress_proxy: tokio::sync::OnceCell<EgressProxy>,
+    /// Live `[settings].dns_servers` for that proxy's lookups; `None` =
+    /// system resolver.
+    dns_settings: Option<Arc<crate::settings::RuntimeSettings>>,
 }
 
 struct Launched {
@@ -143,8 +146,16 @@ impl CdpEngine {
             reaper_started: AtomicBool::new(false),
             allow_private_targets,
             blocklist,
-            dns_cache: Arc::new(StdMutex::new(BoundedMap::new(DNS_CACHE_CAP))),
+            egress_proxy: tokio::sync::OnceCell::new(),
+            dns_settings: None,
         }
+    }
+
+    /// Resolve browser egress through the live `[settings].dns_servers`
+    /// (same backend as the fast path) instead of the system resolver.
+    pub fn with_dns_settings(mut self, settings: Arc<crate::settings::RuntimeSettings>) -> Self {
+        self.dns_settings = Some(settings);
+        self
     }
 
     fn touch(&self) {
@@ -273,18 +284,30 @@ impl BrowserEngine for CdpEngine {
 
         // Per-context proxy: the shared Chromium is launched without one, so a
         // per-request egress (a named profile or a raw proxy_url) is applied
-        // here on the browser context. Without this the CDP tier silently
-        // egressed direct and `opts.egress` was carried but dropped.
+        // here on the browser context. A `direct` context rides cobweb's own
+        // connect-time SSRF proxy instead of the box's network, so every
+        // name is resolved and vetted exactly once, by the code that then
+        // connects (DNS rebinding, WebSockets — see `egress_proxy.rs`).
         //
-        // No `proxyBypassList` / `<-loopback>` here on purpose: when a proxy is
-        // set, loopback and private targets must ride it too, not slip out
-        // direct (SSRF hardening — the entry-point `ssrf::guard_url` already
-        // rejects a private *target*; this stops a redirect/subresource from
-        // reaching one via the box's own network).
-        let mut ctx_params = json!({ "disposeOnDetach": true });
-        if let Some(proxy) = opts.egress.proxy.as_ref() {
-            ctx_params["proxyServer"] = json!(proxy.as_str().trim_end_matches('/'));
-        }
+        // `<-loopback>`: Chromium implicitly *bypasses* any proxy for
+        // localhost/loopback targets; this removes that exception so they
+        // ride the proxy (and its checks) like everything else.
+        let proxy_server = match opts.egress.proxy.as_ref() {
+            Some(p) => p.as_str().trim_end_matches('/').to_string(),
+            None => self
+                .egress_proxy
+                .get_or_try_init(|| {
+                    EgressProxy::start(self.allow_private_targets, self.dns_settings.clone())
+                })
+                .await
+                .map_err(|e| BrowserError::Unavailable(format!("egress proxy: {e}")))?
+                .url(),
+        };
+        let ctx_params = json!({
+            "disposeOnDetach": true,
+            "proxyServer": proxy_server,
+            "proxyBypassList": "<-loopback>",
+        });
         let bc = client
             .call("Target.createBrowserContext", ctx_params, None)
             .await?;
@@ -339,9 +362,7 @@ impl BrowserEngine for CdpEngine {
             last_used: self.last_used.clone(),
             _permit: permit,
             sessions: Arc::new(StdMutex::new(sessions)),
-            is_direct: opts.egress.is_direct(),
             fetch_guard: None,
-            dns_cache: self.dns_cache.clone(),
         };
         cx.setup(&opts, self.allow_private_targets).await?;
         Ok(Box::new(cx))
@@ -395,18 +416,11 @@ struct CdpContext {
     /// plus any auto-attached sub-frame — shared with the Fetch-domain SSRF
     /// guard task so it knows which `Fetch.requestPaused` events are ours.
     sessions: Arc<StdMutex<std::collections::HashSet<String>>>,
-    /// Whether this context's egress is `direct` (no proxy) — mirrors
-    /// `ssrf::guard_url`'s own rule: a proxied egress resolves *at the proxy*,
-    /// so only the literal-IP check applies there; a direct egress also gets
-    /// the DNS-resolved check.
-    is_direct: bool,
     /// The background task applying the Fetch-domain SSRF guard (see
     /// `spawn_context_guard`) to every request this context's sessions make.
     /// Aborted on `close()`/`Drop` — it would otherwise outlive the context,
     /// one leaked task per acquired context.
     fetch_guard: Option<tokio::task::JoinHandle<()>>,
-    /// Engine-wide DNS verdict cache handed to the guard task.
-    dns_cache: DnsVerdictCache,
 }
 
 impl CdpContext {
@@ -464,14 +478,12 @@ impl CdpContext {
             client: self.client.clone(),
             sessions: self.sessions.clone(),
             allow_private,
-            is_direct: self.is_direct,
             trackers: self
                 .block_trackers
                 .then(|| self.blocklist.domain_set())
                 .filter(|s| !s.is_empty()),
             ua: self.ua.clone(),
             blocked_urls: self.blocked_urls(),
-            dns_cache: self.dns_cache.clone(),
         }));
 
         let (_, _, _, _, tree, _) = tokio::try_join!(
@@ -1222,42 +1234,21 @@ enum FetchDecision {
     Block(&'static str),
 }
 
-/// Engine-wide cache of DNS verdicts: host -> (block reason, when). Every
-/// request a page makes is paused on the guard, and without a cache each one
-/// paid a blocking `getaddrinfo` round-trip (on tokio's blocking pool) — a
-/// page with 150 sub-resources on 20 hosts did 150 lookups on its critical
-/// path. Entries live [`DNS_CACHE_TTL`]; this does not widen the DNS-rebinding
-/// window in any meaningful way (Chromium resolves independently of this
-/// check either way — see the note on [`fetch_guard_decision`]).
-type DnsVerdictCache = Arc<StdMutex<BoundedMap<String, (Option<&'static str>, Instant)>>>;
-const DNS_CACHE_CAP: usize = 2048;
-const DNS_CACHE_TTL: Duration = Duration::from_secs(30);
-
-/// Vet one request URL the browser is about to make, mirroring
-/// `ssrf::guard_url`'s own rules (same literal-IP-always, DNS-only-when-direct
-/// split) but as a fast, dependency-light, independently-unit-testable
-/// function: it can't call `ssrf::guard_url` directly because that takes a
-/// `&Url` + does its own thing with schemes cobweb's top-level entry points
-/// never see (`data:`, `blob:`, `chrome-extension:`, …) which are legitimate
-/// here and must not be blocked or even looked at.
+/// Vet one request URL the browser is about to make — the cheap, early
+/// layer of the browser's SSRF defence: `[blocklist]` tracker domains,
+/// `localhost` names and literal non-global IPs are failed right here,
+/// before Chromium opens a connection. Host *names* are not resolved here:
+/// every context egresses through a proxy (cobweb's own connect-time
+/// checking `egress_proxy` for `direct`, the operator's/caller's proxy
+/// otherwise), and a lookup here would only be a second, raceable opinion
+/// on the critical path of every request.
 ///
-/// **Fail-closed**: a name that doesn't resolve is refused (Chromium couldn't
-/// reach it through the same resolver anyway), instead of being allowed and
-/// then resolved a second time by Chromium — the gap a slow or flaky
-/// attacker-controlled authoritative DNS server used to open.
-///
-/// Known limit: Chromium does its own resolution after this check, so a
-/// name with a 0-TTL record that flips between a public and a private
-/// address (DNS rebinding) can still race it. Closing that fully needs the
-/// browser's traffic to egress through a connect-time-checking proxy; until
-/// then, `[server].allow_private_targets = false` plus a host firewall is the
-/// defence in depth.
-async fn fetch_guard_decision(
+/// Schemes cobweb's top-level entry points never see (`data:`, `blob:`,
+/// `chrome-extension:`, …) are legitimate here and are left alone.
+fn fetch_guard_decision(
     url_s: &str,
-    is_direct: bool,
     allow_private: bool,
     trackers: Option<&HashSet<String>>,
-    dns_cache: Option<&DnsVerdictCache>,
 ) -> FetchDecision {
     let Ok(url) = Url::parse(url_s) else {
         // An unparsable "URL" can't be an SSRF vector via cobweb's own network
@@ -1273,8 +1264,9 @@ async fn fetch_guard_decision(
     let Some(host) = url.host_str() else {
         return FetchDecision::Allow;
     };
+    let bare = crate::ssrf::strip_brackets(host);
     if let Some(set) = trackers {
-        if crate::blocklist::host_is_blocked(set, crate::ssrf::strip_brackets(host)) {
+        if crate::blocklist::host_is_blocked(set, bare) {
             return FetchDecision::Block("blocklisted tracker/ad domain");
         }
     }
@@ -1282,63 +1274,13 @@ async fn fetch_guard_decision(
     if !allow_private && (lower == "localhost" || lower.ends_with(".localhost")) {
         return FetchDecision::Block("localhost");
     }
-    if let Ok(ip) = crate::ssrf::strip_brackets(host).parse::<std::net::IpAddr>() {
-        return match crate::ssrf::block_reason(ip, allow_private) {
-            Some(r) => FetchDecision::Block(r),
-            None => FetchDecision::Allow,
-        };
-    }
-    if !is_direct {
-        // Proxied egress: the proxy resolves and owns the exit, same rule as
-        // `ssrf::guard_url`'s direct-egress split.
-        return FetchDecision::Allow;
-    }
-
-    if let Some(cache) = dns_cache {
-        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((verdict, at)) = g.get(lower.as_str()) {
-            if at.elapsed() < DNS_CACHE_TTL {
-                return verdict.map_or(FetchDecision::Allow, FetchDecision::Block);
-            }
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if let Some(r) = crate::ssrf::block_reason(ip, allow_private) {
+            return FetchDecision::Block(r);
         }
     }
-
-    let port = url.port_or_known_default().unwrap_or(0);
-    let verdict: Option<&'static str> = match tokio::net::lookup_host((lower.as_str(), port)).await
-    {
-        Ok(addrs) => {
-            let mut verdict = None;
-            let mut any = false;
-            for sa in addrs {
-                any = true;
-                if let Some(r) = crate::ssrf::block_reason(sa.ip(), allow_private) {
-                    verdict = Some(r);
-                    break;
-                }
-            }
-            if any {
-                verdict
-            } else {
-                Some("unresolvable host")
-            }
-        }
-        Err(_) => Some("unresolvable host"),
-    };
-    if let Some(cache) = dns_cache {
-        cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(lower, (verdict, Instant::now()));
-    }
-    verdict.map_or(FetchDecision::Allow, FetchDecision::Block)
+    FetchDecision::Allow
 }
-
-/// A hard ceiling on `fetch_guard_decision` so a slow/wedged DNS resolution
-/// never leaves a `Fetch.requestPaused` — and therefore the request itself —
-/// hanging indefinitely. On expiry the request is **failed**, not allowed:
-/// failing open here was a guard bypass for anyone controlling a slow
-/// authoritative DNS server.
-const FETCH_GUARD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `Target.setAutoAttach` params used for the page and, recursively, every
 /// adopted child: attach children *paused* so they can be instrumented
@@ -1352,14 +1294,12 @@ struct GuardCtx {
     client: Arc<CdpClient>,
     sessions: Arc<StdMutex<std::collections::HashSet<String>>>,
     allow_private: bool,
-    is_direct: bool,
     /// `[blocklist]` domains when the context's `block_trackers` is set.
     trackers: Option<Arc<HashSet<String>>>,
     /// Jar-pinned UA override (empty = none), re-applied to every child.
     ua: String,
     /// `Network.setBlockedURLs` list (static `BLOCKED_URLS` or empty).
     blocked_urls: Arc<Vec<String>>,
-    dns_cache: DnsVerdictCache,
 }
 
 impl GuardCtx {
@@ -1421,23 +1361,13 @@ fn spawn_context_guard(g: GuardCtx) -> tokio::task::JoinHandle<()> {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    // One task per intercepted request so a slow DNS lookup
-                    // for one never delays the decision for another.
-                    let g = g.clone();
+                    // The decision is synchronous (no DNS); only the CDP
+                    // round-trip answering it is awaited, off this loop.
+                    let decision =
+                        fetch_guard_decision(&url_s, g.allow_private, g.trackers.as_deref());
+                    let client = g.client.clone();
                     tokio::spawn(async move {
-                        let decision = tokio::time::timeout(
-                            FETCH_GUARD_TIMEOUT,
-                            fetch_guard_decision(
-                                &url_s,
-                                g.is_direct,
-                                g.allow_private,
-                                g.trackers.as_deref(),
-                                Some(&g.dns_cache),
-                            ),
-                        )
-                        .await
-                        .unwrap_or(FetchDecision::Block("guard timed out"));
-                        answer_paused(&g.client, &sid, request_id, &url_s, decision).await;
+                        answer_paused(&client, &sid, request_id, &url_s, decision).await;
                     });
                 }
                 "Target.attachedToTarget" => {
@@ -1714,8 +1644,8 @@ mod tests {
     // SSRF guard (C1: cobweb's own network stack re-checking every request a
     // browser context makes, not just the entry-point navigation URL). It's
     // deliberately factored out so it's testable without a real Chromium.
-    #[tokio::test]
-    async fn fetch_guard_blocks_literal_private_and_metadata_addresses() {
+    #[test]
+    fn fetch_guard_blocks_literal_private_and_metadata_addresses() {
         for url in [
             "http://127.0.0.1:8096/",
             "http://169.254.169.254/latest/meta-data/",
@@ -1724,7 +1654,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    fetch_guard_decision(url, true, false, None, None).await,
+                    fetch_guard_decision(url, false, None),
                     FetchDecision::Block(_)
                 ),
                 "{url} should be blocked"
@@ -1732,90 +1662,63 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn fetch_guard_blocks_literal_private_even_on_a_proxied_egress() {
+    #[test]
+    fn fetch_guard_blocks_literal_private_even_on_a_proxied_egress() {
         // Mirrors ssrf::guard_url: the literal-IP check is unconditional
         // regardless of is_direct.
         assert!(matches!(
-            fetch_guard_decision("http://127.0.0.1/", false, false, None, None).await,
+            fetch_guard_decision("http://127.0.0.1/", false, None),
             FetchDecision::Block(_)
         ));
     }
 
-    #[tokio::test]
-    async fn fetch_guard_allows_public_addresses() {
+    #[test]
+    fn fetch_guard_allows_public_addresses() {
         assert_eq!(
-            fetch_guard_decision("https://1.1.1.1/", true, false, None, None).await,
+            fetch_guard_decision("https://1.1.1.1/", false, None),
             FetchDecision::Allow
         );
         // A hostname on a proxied egress is left to the proxy (no DNS here,
         // so this stays hermetic).
         assert_eq!(
-            fetch_guard_decision("https://example.com/", false, false, None, None).await,
+            fetch_guard_decision("https://example.com/", false, None),
             FetchDecision::Allow
         );
     }
 
-    // Fail-closed: a direct-egress name that doesn't resolve used to be
-    // allowed (and then resolved again by Chromium itself).
-    #[tokio::test]
-    async fn fetch_guard_blocks_an_unresolvable_host_on_direct() {
-        assert!(matches!(
-            fetch_guard_decision("https://nope.invalid/", true, false, None, None).await,
-            FetchDecision::Block(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn fetch_guard_blocks_blocklisted_trackers_before_any_dns() {
+    #[test]
+    fn fetch_guard_blocks_blocklisted_trackers_before_any_dns() {
         let set: super::HashSet<String> = ["ads.example.com".to_string()].into_iter().collect();
         assert!(matches!(
-            fetch_guard_decision(
-                "https://x.ads.example.com/p.js",
-                false,
-                false,
-                Some(&set),
-                None
-            )
-            .await,
+            fetch_guard_decision("https://x.ads.example.com/p.js", false, Some(&set)),
             FetchDecision::Block(_)
         ));
         assert_eq!(
-            fetch_guard_decision(
-                "https://cdn.example.com/p.js",
-                false,
-                false,
-                Some(&set),
-                None
-            )
-            .await,
+            fetch_guard_decision("https://cdn.example.com/p.js", false, Some(&set)),
             FetchDecision::Allow
         );
     }
 
-    #[tokio::test]
-    async fn fetch_guard_allows_non_http_schemes_untouched() {
+    #[test]
+    fn fetch_guard_allows_non_http_schemes_untouched() {
         for url in [
             "data:text/plain,hi",
             "blob:https://example.com/abc",
             "about:blank",
         ] {
-            assert_eq!(
-                fetch_guard_decision(url, true, false, None, None).await,
-                FetchDecision::Allow
-            );
+            assert_eq!(fetch_guard_decision(url, false, None), FetchDecision::Allow);
         }
     }
 
-    #[tokio::test]
-    async fn fetch_guard_respects_allow_private_targets() {
+    #[test]
+    fn fetch_guard_respects_allow_private_targets() {
         assert_eq!(
-            fetch_guard_decision("http://10.0.0.5/", true, true, None, None).await,
+            fetch_guard_decision("http://10.0.0.5/", true, None),
             FetchDecision::Allow
         );
         // ...but never the always-bogus ranges, same as ssrf::block_reason.
         assert!(matches!(
-            fetch_guard_decision("http://169.254.169.254/", true, true, None, None).await,
+            fetch_guard_decision("http://169.254.169.254/", true, None),
             FetchDecision::Block(_)
         ));
     }

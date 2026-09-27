@@ -135,13 +135,16 @@ impl AppState {
                 } else {
                     settings.idle_shutdown_secs()
                 };
-                Some(Arc::new(CdpEngine::new(
-                    config.browser.clone(),
-                    config.server.max_contexts,
-                    idle,
-                    config.server.allow_private_targets,
-                    blocklist.clone(),
-                )))
+                Some(Arc::new(
+                    CdpEngine::new(
+                        config.browser.clone(),
+                        config.server.max_contexts,
+                        idle,
+                        config.server.allow_private_targets,
+                        blocklist.clone(),
+                    )
+                    .with_dns_settings(settings.clone()),
+                ))
             }
         };
 

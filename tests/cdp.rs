@@ -393,3 +393,46 @@ async fn sniffs_a_manifest_fetched_by_a_cross_site_iframe() {
     cx.close().await;
     engine.shutdown().await;
 }
+
+// Every `direct` context egresses through cobweb's connect-time SSRF proxy
+// (`browser/egress_proxy.rs`), loopback included (`<-loopback>`). The proxy
+// rewrites plain-http requests with `Connection: close`, which Chromium never
+// sends on its own — so seeing it upstream proves the traffic went through
+// the proxy rather than straight out of the browser.
+#[tokio::test]
+async fn direct_browser_traffic_rides_the_egress_proxy() {
+    if !have_chromium() {
+        eprintln!("skip direct_browser_traffic_rides_the_egress_proxy: no chromium on PATH");
+        return;
+    }
+    use cobweb::browser::WaitFor;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/p"))
+        .respond_with(html_page("<html><body>hi</body></html>"))
+        .mount(&upstream)
+        .await;
+
+    let engine = CdpEngine::new(headless_cfg(), 1, 0, true, no_blocklist());
+    engine.ensure_ready().await.expect("Chromium should launch");
+    let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
+    let url = Url::parse(&format!("{}/p", upstream.uri())).unwrap();
+    cx.navigate(&url, WaitFor::Load, Duration::from_secs(15))
+        .await
+        .expect("navigate");
+    cx.close().await;
+    engine.shutdown().await;
+
+    let reqs = upstream.received_requests().await.unwrap();
+    let page = reqs
+        .iter()
+        .find(|r| r.url.path() == "/p")
+        .expect("page request reached upstream");
+    let conn = page
+        .headers
+        .get("connection")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(conn.eq_ignore_ascii_case("close"), "connection: {conn:?}");
+}

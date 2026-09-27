@@ -311,6 +311,58 @@ pub async fn guard_egress(egress: &crate::egress::Egress, allow_private: bool) -
     Ok(())
 }
 
+/// Resolve `host:port` and vet every address — the connect-time check the
+/// browser's egress proxy (`browser::egress_proxy`) runs, so the address it
+/// then connects to is exactly the one that was checked (no second lookup
+/// for a rebinding record to flip). Same rules as [`guard_url`]'s
+/// direct-egress branch: literal IPs classified directly, `localhost` names
+/// refused unless relaxed, and *any* non-global answer refuses the name.
+/// Resolution uses the live `[settings].dns_servers` backend (system
+/// resolver on failure, as in [`GuardedResolver`]) when `settings` is given.
+pub async fn vetted_socket_addrs(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+    settings: Option<&RuntimeSettings>,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let bare = strip_brackets(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return match block_reason(ip, allow_private) {
+            Some(r) => Err(format!("`{host}` is a {r} address")),
+            None => Ok(vec![SocketAddr::new(ip, port)]),
+        };
+    }
+    let lower = bare.trim_end_matches('.').to_ascii_lowercase();
+    if !allow_private && (lower == "localhost" || lower.ends_with(".localhost")) {
+        return Err(format!("`{host}` is localhost"));
+    }
+    let custom = settings.map(RuntimeSettings::dns_snapshot);
+    let mut ips: Vec<IpAddr> = match custom.as_deref().map(|d| &d.backend) {
+        Some(DnsBackend::Custom(r)) => match r.lookup_ip(lower.as_str()).await {
+            Ok(l) => l.iter().collect(),
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if ips.is_empty() {
+        ips = tokio::net::lookup_host((lower.as_str(), port))
+            .await
+            .map_err(|e| format!("cannot resolve `{host}`: {e}"))?
+            .map(|sa| sa.ip())
+            .collect();
+    }
+    if ips.is_empty() {
+        return Err(format!("`{host}` has no addresses"));
+    }
+    if let Some(r) = ips.iter().find_map(|ip| block_reason(*ip, allow_private)) {
+        return Err(format!("`{host}` resolves to a {r} address"));
+    }
+    Ok(ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // wreq redirect policy
 // ─────────────────────────────────────────────────────────────────────────────
@@ -686,6 +738,27 @@ mod tests {
                 .is_ok(),
             "allow_private_targets = true must let a loopback resolution through"
         );
+    }
+
+    #[tokio::test]
+    async fn vetted_socket_addrs_applies_the_guard_rules() {
+        assert!(vetted_socket_addrs("169.254.169.254", 80, true, None)
+            .await
+            .is_err());
+        assert!(vetted_socket_addrs("[::1]", 80, false, None).await.is_err());
+        assert!(vetted_socket_addrs("localhost", 80, false, None)
+            .await
+            .is_err());
+        assert!(vetted_socket_addrs("nope.invalid", 80, false, None)
+            .await
+            .is_err());
+        let ok = vetted_socket_addrs("127.0.0.1", 8080, true, None)
+            .await
+            .unwrap();
+        assert_eq!(ok, vec!["127.0.0.1:8080".parse().unwrap()]);
+        assert!(vetted_socket_addrs("localhost", 80, true, None)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
