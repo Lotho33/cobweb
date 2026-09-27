@@ -335,3 +335,61 @@ async fn browser_guard_refuses_redirect_to_metadata() {
     cx.close().await;
     engine.shutdown().await;
 }
+
+// A cross-site iframe runs in its own out-of-process target. It is now
+// auto-attached *paused* (`waitForDebuggerOnStart: true`) and only resumed
+// by the per-context guard once its `Fetch.enable` is in place — this proves
+// the resume actually happens (no hung child) and that the child's own
+// requests are visible to the sniff through its adopted session.
+#[tokio::test]
+async fn sniffs_a_manifest_fetched_by_a_cross_site_iframe() {
+    if !have_chromium() {
+        eprintln!("skip sniffs_a_manifest_fetched_by_a_cross_site_iframe: no chromium on PATH");
+        return;
+    }
+
+    let upstream = MockServer::start().await;
+    let port = upstream.address().port();
+    // Outer page on 127.0.0.1, iframe on `localhost` — a different site, so
+    // Chromium's site isolation puts it in its own renderer/target.
+    Mock::given(method("GET"))
+        .and(path("/outer"))
+        .respond_with(html_page(&format!(
+            r#"<html><body><iframe src="http://localhost:{port}/child"></iframe></body></html>"#
+        )))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/child"))
+        .respond_with(html_page(
+            r#"<html><body><script>fetch('/child/master.m3u8').catch(function(){});</script></body></html>"#,
+        ))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/child/master.m3u8"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("#EXTM3U"))
+        .mount(&upstream)
+        .await;
+
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, true, no_blocklist());
+    engine.ensure_ready().await.expect("Chromium should launch");
+    let mut cx = engine
+        .acquire(ctx_opts().await)
+        .await
+        .expect("acquire context");
+
+    let trigger = Url::parse(&format!("http://127.0.0.1:{port}/outer")).unwrap();
+    let patterns = build_globset(&["*.m3u8".to_string()]).unwrap();
+    let hit = cx
+        .sniff(&trigger, &patterns, Duration::from_secs(20), None)
+        .await
+        .expect("sniff should catch the iframe's fetch");
+    assert!(
+        hit.url.as_str().ends_with("/child/master.m3u8"),
+        "unexpected hit: {}",
+        hit.url
+    );
+    cx.close().await;
+    engine.shutdown().await;
+}

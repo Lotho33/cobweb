@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SettingsConfig;
 use crate::error::{CobwebError, Result};
+use crate::jar::clamp_ttl_secs;
 use crate::util::persist_json;
 
 /// Cloudflare's public resolver — the default so cobweb resolves correctly
@@ -187,9 +188,11 @@ impl RuntimeSettings {
             state_path: cfg.state_path,
             dns: StdRwLock::new(Arc::new(dns)),
             nav_timeout_ms: AtomicU64::new(doc.nav_timeout_ms),
-            jar_default_ttl_secs: AtomicU64::new(doc.jar_default_ttl_secs),
+            jar_default_ttl_secs: AtomicU64::new(clamp_ttl_secs(doc.jar_default_ttl_secs)),
             jar_fail_streak: AtomicU32::new(doc.jar_fail_streak.max(1)),
-            flaresolverr_session_ttl_secs: AtomicU64::new(doc.flaresolverr_session_ttl_secs),
+            flaresolverr_session_ttl_secs: AtomicU64::new(clamp_ttl_secs(
+                doc.flaresolverr_session_ttl_secs,
+            )),
             idle_shutdown_secs: AtomicU64::new(doc.idle_shutdown_secs),
         }
     }
@@ -225,15 +228,18 @@ impl RuntimeSettings {
         if let Some(v) = patch.nav_timeout_ms {
             self.nav_timeout_ms.store(v, Ordering::Relaxed);
         }
+        // TTLs are clamped (`jar::MAX_TTL_SECS`): an absurd value used to
+        // overflow `chrono` in `JarEntry::expiry` and panic every jar read.
         if let Some(v) = patch.jar_default_ttl_secs {
-            self.jar_default_ttl_secs.store(v, Ordering::Relaxed);
+            self.jar_default_ttl_secs
+                .store(clamp_ttl_secs(v), Ordering::Relaxed);
         }
         if let Some(v) = patch.jar_fail_streak {
             self.jar_fail_streak.store(v.max(1), Ordering::Relaxed);
         }
         if let Some(v) = patch.flaresolverr_session_ttl_secs {
             self.flaresolverr_session_ttl_secs
-                .store(v, Ordering::Relaxed);
+                .store(clamp_ttl_secs(v), Ordering::Relaxed);
         }
         if let Some(v) = patch.idle_shutdown_secs {
             self.idle_shutdown_secs.store(v, Ordering::Relaxed);

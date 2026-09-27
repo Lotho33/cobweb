@@ -8,7 +8,6 @@
 //! The client is behind the [`FastClient`] trait so `wreq` can be swapped for
 //! `impit` without touching the pipeline (DESIGN.md §14.1).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +19,7 @@ use crate::egress::Egress;
 use crate::error::{CobwebError, Result};
 use crate::jar::Cookie;
 use crate::settings::RuntimeSettings;
+use crate::util::BoundedMap;
 
 /// What the pipeline hands the client for one fetch.
 pub struct FetchRequest<'a> {
@@ -74,7 +74,11 @@ pub trait FastClient: Send + Sync {
 /// building one sets up a TLS/H2 fingerprint and a proxy connector, both worth
 /// reusing across requests.
 pub struct WreqClient {
-    cache: Mutex<HashMap<String, wreq::Client>>,
+    /// Capped at [`CLIENT_CACHE_CAP`]: the key includes the egress's jar key,
+    /// which for a caller-supplied `proxy_url` is distinct per proxy — an
+    /// unbounded map let a caller cycling through proxy URLs pile up whole
+    /// clients (TLS context + connection pool each) forever.
+    cache: Mutex<BoundedMap<String, wreq::Client>>,
     /// Passed to the per-client [`crate::ssrf::GuardedResolver`].
     allow_private_targets: bool,
     /// Shared with every cached client's `GuardedResolver` so a live
@@ -82,6 +86,10 @@ pub struct WreqClient {
     /// effect immediately, without rebuilding any cached `wreq::Client`.
     settings: Arc<RuntimeSettings>,
 }
+
+/// Max cached `wreq::Client`s (named profiles × 2 kinds, plus recent raw
+/// proxies). An evicted client is simply rebuilt on next use.
+const CLIENT_CACHE_CAP: usize = 64;
 
 /// How a cached `wreq::Client` should be tuned.
 #[derive(Clone, Copy)]
@@ -96,7 +104,7 @@ enum ClientKind {
 impl WreqClient {
     pub fn new(allow_private_targets: bool, settings: Arc<RuntimeSettings>) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(BoundedMap::new(CLIENT_CACHE_CAP)),
             allow_private_targets,
             settings,
         }
@@ -107,7 +115,14 @@ impl WreqClient {
             ClientKind::FastPath => "fp",
             ClientKind::Stream => "st",
         };
-        let key = format!("{}|{kind_tag}", egress.jar_key());
+        // Keyed on the full proxy URL (credentials included — in-memory
+        // only), not `jar_key()`: two raw `proxy_url`s for the same host:port
+        // with different credentials used to share one cached client, so the
+        // second caller silently rode the first one's proxy login.
+        let key = format!(
+            "{}|{kind_tag}",
+            egress.proxy.as_ref().map_or("direct", |p| p.as_str())
+        );
         if let Some(c) = self
             .cache
             .lock()
@@ -153,8 +168,12 @@ impl WreqClient {
         };
 
         if let Some(proxy_url) = &egress.proxy {
-            let proxy = wreq::Proxy::all(proxy_url.as_str())
-                .map_err(|e| CobwebError::Config(format!("bad proxy {proxy_url}: {e}")))?;
+            let proxy = wreq::Proxy::all(proxy_url.as_str()).map_err(|e| {
+                CobwebError::Config(format!(
+                    "bad proxy {}: {e}",
+                    crate::util::redact_url_credentials(proxy_url)
+                ))
+            })?;
             builder = builder.proxy(proxy);
         } else {
             // Named `direct` must never inherit an ambient HTTP(S)_PROXY env.
@@ -314,7 +333,7 @@ pub fn ttl_hint_from(cookies: &[Cookie], name: &str) -> Option<u64> {
     cookies
         .iter()
         .find(|c| c.name == name && c.expires > now)
-        .map(|c| (c.expires - now).max(0.0) as u64)
+        .map(|c| crate::jar::clamp_ttl_secs((c.expires - now).max(0.0) as u64))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

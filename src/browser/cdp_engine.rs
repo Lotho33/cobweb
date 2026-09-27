@@ -4,6 +4,7 @@
 //! `Target.createBrowserContext` (separate cookie jar) + one page in it.
 //! JS runs in a `Page.createIsolatedWorld` — **`Runtime.enable` is never sent**.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use crate::blocklist::Blocklist;
 use crate::config::BrowserConfig;
 use crate::fastpath::looks_like_cloudflare_challenge;
 use crate::jar::{Cookie, StorageState};
+use crate::util::BoundedMap;
 
 const STEALTH_JS: &str = r#"
 Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -104,11 +106,14 @@ pub struct CdpEngine {
     sem: Arc<Semaphore>,
     reaper_started: AtomicBool,
     /// `[server].allow_private_targets` — threaded into each context's Fetch-domain
-    /// SSRF guard (see `spawn_fetch_guard`), matching the top-level `ssrf::guard_url`.
+    /// SSRF guard (see `spawn_context_guard`), matching the top-level `ssrf::guard_url`.
     allow_private_targets: bool,
-    /// Tracker/ad domain patterns from `[blocklist]` — merged with
-    /// `BLOCKED_URLS` when a context's `block_trackers` is set.
+    /// Tracker/ad domains from `[blocklist]` — enforced by the per-context
+    /// guard task when a context's `block_trackers` is set.
     blocklist: Arc<Blocklist>,
+    /// Short-lived cache of the guard's DNS verdicts, shared by every context
+    /// (see [`DnsVerdictCache`]).
+    dns_cache: DnsVerdictCache,
 }
 
 struct Launched {
@@ -138,6 +143,7 @@ impl CdpEngine {
             reaper_started: AtomicBool::new(false),
             allow_private_targets,
             blocklist,
+            dns_cache: Arc::new(StdMutex::new(BoundedMap::new(DNS_CACHE_CAP))),
         }
     }
 
@@ -327,6 +333,7 @@ impl BrowserEngine for CdpEngine {
             sessions: Arc::new(StdMutex::new(sessions)),
             is_direct: opts.egress.is_direct(),
             fetch_guard: None,
+            dns_cache: self.dns_cache.clone(),
         };
         cx.setup(&opts, self.allow_private_targets).await?;
         Ok(Box::new(cx))
@@ -386,10 +393,12 @@ struct CdpContext {
     /// the DNS-resolved check.
     is_direct: bool,
     /// The background task applying the Fetch-domain SSRF guard (see
-    /// `spawn_fetch_guard`) to every request this context's sessions make.
+    /// `spawn_context_guard`) to every request this context's sessions make.
     /// Aborted on `close()`/`Drop` — it would otherwise outlive the context,
     /// one leaked task per acquired context.
     fetch_guard: Option<tokio::task::JoinHandle<()>>,
+    /// Engine-wide DNS verdict cache handed to the guard task.
+    dns_cache: DnsVerdictCache,
 }
 
 impl CdpContext {
@@ -397,20 +406,17 @@ impl CdpContext {
         Some(&self.session_id)
     }
 
-    /// The union of `BLOCKED_URLS` (media/asset extensions + the small
-    /// built-in ad-domain set, gated on `block_resources`) and the live
-    /// `[blocklist]` tracker/ad patterns (gated on `block_trackers`). CDP has
-    /// no "append" for `Network.setBlockedURLs` — a second call replaces the
-    /// first — so every call site needs the merged list, issued once.
-    fn blocked_urls(&self) -> Vec<String> {
-        let mut urls = Vec::new();
+    /// `BLOCKED_URLS` (media/asset extensions + the small built-in ad-domain
+    /// set) when `block_resources` is set, for `Network.setBlockedURLs`. The
+    /// `[blocklist]` tracker domains are *not* in here any more: they're
+    /// enforced by the guard task with a hash lookup (see
+    /// `src/blocklist.rs`'s module doc for why).
+    fn blocked_urls(&self) -> Arc<Vec<String>> {
         if self.block_resources {
-            urls.extend(BLOCKED_URLS.iter().map(|s| s.to_string()));
+            Arc::new(BLOCKED_URLS.iter().map(|s| s.to_string()).collect())
+        } else {
+            Arc::new(Vec::new())
         }
-        if self.block_trackers {
-            urls.extend(self.blocklist.snapshot().iter().cloned());
-        }
-        urls
     }
 
     async fn call(&self, method: &str, params: Value) -> BrowserResult<Value> {
@@ -432,31 +438,9 @@ impl CdpContext {
         // `fetch()`/`XHR` a page's own JS makes (including the payload a
         // caller passes to `/v1/eval`) goes through Chromium's own network
         // stack and previously bypassed cobweb's SSRF check entirely. Every
-        // request is paused (`Fetch.requestPaused`) until `spawn_fetch_guard`'s
+        // request is paused (`Fetch.requestPaused`) until `spawn_context_guard`'s
         // background task below vets it and calls `Fetch.continueRequest` /
         // `Fetch.failRequest`.
-        let (_, _, _, _, tree) = tokio::try_join!(
-            self.call("Page.enable", json!({})),
-            self.call("Network.enable", network_enable_params()),
-            self.call(
-                "Fetch.enable",
-                json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Request" }] }),
-            ),
-            self.call("Page.setLifecycleEventsEnabled", json!({ "enabled": true })),
-            self.call("Page.getFrameTree", json!({})),
-        )?;
-        self.frame_id = tree
-            .pointer("/frameTree/frame/id")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-
-        self.fetch_guard = Some(spawn_fetch_guard(
-            self.client.clone(),
-            self.sessions.clone(),
-            allow_private,
-            self.is_direct,
-        ));
-
         // Chromium's `--user-agent` / `--accept-lang` launch flags already pin a
         // clean desktop-Chrome UA on every frame. Only add a CDP override when
         // the jar pins a *different* UA for this domain (kept in sync with the
@@ -465,6 +449,45 @@ impl CdpContext {
             Some(u) if !u.is_empty() && *u != self.default_ua => u.clone(),
             _ => String::new(),
         };
+
+        // Started (and subscribed) *before* anything below can make Chromium
+        // pause a request or attach a child target, so no event is missed.
+        self.fetch_guard = Some(spawn_context_guard(GuardCtx {
+            client: self.client.clone(),
+            sessions: self.sessions.clone(),
+            allow_private,
+            is_direct: self.is_direct,
+            trackers: self
+                .block_trackers
+                .then(|| self.blocklist.domain_set())
+                .filter(|s| !s.is_empty()),
+            ua: self.ua.clone(),
+            blocked_urls: self.blocked_urls(),
+            dns_cache: self.dns_cache.clone(),
+        }));
+
+        let (_, _, _, _, tree, _) = tokio::try_join!(
+            self.call("Page.enable", json!({})),
+            self.call("Network.enable", network_enable_params()),
+            self.call(
+                "Fetch.enable",
+                json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Request" }] }),
+            ),
+            self.call("Page.setLifecycleEventsEnabled", json!({ "enabled": true })),
+            self.call("Page.getFrameTree", json!({})),
+            // Every child target (out-of-process cross-site iframe, worker,
+            // popup) is attached *paused* and only resumed by the guard task
+            // once its own `Fetch.enable` is in place. With
+            // `waitForDebuggerOnStart: false` (and no auto-attach at all
+            // outside `sniff`) a child ran — and could reach a private
+            // address through its own session — before, or entirely without,
+            // the SSRF guard.
+            self.call("Target.setAutoAttach", auto_attach_params()),
+        )?;
+        self.frame_id = tree
+            .pointer("/frameTree/frame/id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         // Everything below only needs the domains enabled above and is mutually
         // independent — run it concurrently too.
@@ -479,7 +502,7 @@ impl CdpContext {
         let block_fut = async {
             let urls = self.blocked_urls();
             if !urls.is_empty() {
-                self.call("Network.setBlockedURLs", json!({ "urls": urls }))
+                self.call("Network.setBlockedURLs", json!({ "urls": *urls }))
                     .await
                     .map(|_| ())
             } else {
@@ -664,64 +687,6 @@ impl CdpContext {
             )
             .await;
     }
-
-    /// Bring a freshly auto-attached child target (sub-frame) up to the same
-    /// instrumentation as the main page — including the UA and the Fetch-domain
-    /// SSRF guard — then let it run. The child session id is registered in the
-    /// shared `sessions` set *before* any of these calls so `spawn_fetch_guard`
-    /// (already running, watching the whole broadcast stream) recognises its
-    /// `Fetch.requestPaused` events as soon as they can possibly arrive.
-    async fn adopt_child(&self, child_sid: &str) {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(child_sid.to_string());
-        let s = Some(child_sid);
-        let _ = self
-            .client
-            .call("Network.enable", network_enable_params(), s)
-            .await;
-        let _ = self.client.call("Page.enable", json!({}), s).await;
-        let _ = self
-            .client
-            .call(
-                "Fetch.enable",
-                json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Request" }] }),
-                s,
-            )
-            .await;
-        if !self.ua.is_empty() {
-            self.apply_ua(s).await;
-        }
-        let _ = self
-            .client
-            .call(
-                "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": STEALTH_JS }),
-                s,
-            )
-            .await;
-        let urls = self.blocked_urls();
-        if !urls.is_empty() {
-            let _ = self
-                .client
-                .call("Network.setBlockedURLs", json!({ "urls": urls }), s)
-                .await;
-        }
-        let _ = self
-            .client
-            .call(
-                "Target.setAutoAttach",
-                json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
-                s,
-            )
-            .await;
-        // Was paused by waitForDebuggerOnStart — resume (does NOT enable Runtime events).
-        let _ = self
-            .client
-            .call("Runtime.runIfWaitingForDebugger", json!({}), s)
-            .await;
-    }
 }
 
 #[async_trait]
@@ -753,16 +718,10 @@ impl BrowserContext for CdpContext {
         let mut ev = self.client.subscribe();
 
         // Cross-origin embed players (an outer page whose real player lives on
-        // another origin) run in their own out-of-process target. Auto-attach
-        // (paused) so we can instrument each
-        // one before it runs and see its *.m3u8 request. Only done for sniff —
-        // navigate/eval don't want paused subframes blocking `load`.
-        self.call(
-            "Target.setAutoAttach",
-            json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
-        )
-        .await?;
-
+        // another origin) run in their own out-of-process target. `setup()`
+        // auto-attaches those paused and the guard task instruments each one
+        // (Network/Fetch/…) before resuming it, so its *.m3u8 request shows
+        // up on this stream under a session in `self.sessions`.
         let nav = self
             .call("Page.navigate", json!({ "url": trigger.as_str() }))
             .await?;
@@ -933,42 +892,6 @@ impl BrowserContext for CdpContext {
                 Err(_) if pending.is_some() || !remaining.is_zero() => continue,
                 _ => break,
             };
-
-            // A sub-target attached. Adopt sub-frames; kill popup/new-tab pages
-            // (streaming sites open ad popunders — they burn RAM and never close).
-            if e.method == "Target.attachedToTarget" {
-                let ttype = e
-                    .params
-                    .pointer("/targetInfo/type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if ttype == "page" || ttype == "tab" {
-                    if let Some(tid) = e
-                        .params
-                        .pointer("/targetInfo/targetId")
-                        .and_then(Value::as_str)
-                    {
-                        tracing::debug!(tid, "sniff: closing popup target");
-                        // Short timeout: this must not compete with the sniff's
-                        // own deadline for the default 30s — a popup close is
-                        // fire-and-forget from the caller's point of view, and
-                        // the event loop below stops consuming the broadcast
-                        // channel while this is pending.
-                        let _ = self
-                            .client
-                            .call_timeout(
-                                "Target.closeTarget",
-                                json!({ "targetId": tid }),
-                                None,
-                                Duration::from_secs(2),
-                            )
-                            .await;
-                    }
-                } else if let Some(child) = e.params.get("sessionId").and_then(Value::as_str) {
-                    self.adopt_child(child).await;
-                }
-                continue;
-            }
 
             // Accept events from any of our sessions (or session-less events).
             if let Some(sid) = &e.session_id {
@@ -1247,7 +1170,7 @@ impl BrowserContext for CdpContext {
 
 impl Drop for CdpContext {
     fn drop(&mut self) {
-        // The Fetch-domain SSRF guard task (see `spawn_fetch_guard`) is
+        // The Fetch-domain SSRF guard task (see `spawn_context_guard`) is
         // per-context: without this it would outlive the context it was
         // guarding, one leaked task per acquired context (a real per-request
         // leak, unlike the engine-wide idle reaper). `close()` runs before
@@ -1281,7 +1204,7 @@ impl Drop for CdpContext {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fetch-domain SSRF guard
+// Fetch-domain SSRF guard + child-target instrumentation
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// How the SSRF guard should dispose of one intercepted `Fetch.requestPaused`.
@@ -1291,6 +1214,17 @@ enum FetchDecision {
     Block(&'static str),
 }
 
+/// Engine-wide cache of DNS verdicts: host -> (block reason, when). Every
+/// request a page makes is paused on the guard, and without a cache each one
+/// paid a blocking `getaddrinfo` round-trip (on tokio's blocking pool) — a
+/// page with 150 sub-resources on 20 hosts did 150 lookups on its critical
+/// path. Entries live [`DNS_CACHE_TTL`]; this does not widen the DNS-rebinding
+/// window in any meaningful way (Chromium resolves independently of this
+/// check either way — see the note on [`fetch_guard_decision`]).
+type DnsVerdictCache = Arc<StdMutex<BoundedMap<String, (Option<&'static str>, Instant)>>>;
+const DNS_CACHE_CAP: usize = 2048;
+const DNS_CACHE_TTL: Duration = Duration::from_secs(30);
+
 /// Vet one request URL the browser is about to make, mirroring
 /// `ssrf::guard_url`'s own rules (same literal-IP-always, DNS-only-when-direct
 /// split) but as a fast, dependency-light, independently-unit-testable
@@ -1298,26 +1232,49 @@ enum FetchDecision {
 /// `&Url` + does its own thing with schemes cobweb's top-level entry points
 /// never see (`data:`, `blob:`, `chrome-extension:`, …) which are legitimate
 /// here and must not be blocked or even looked at.
-async fn fetch_guard_decision(url_s: &str, is_direct: bool, allow_private: bool) -> FetchDecision {
+///
+/// **Fail-closed**: a name that doesn't resolve is refused (Chromium couldn't
+/// reach it through the same resolver anyway), instead of being allowed and
+/// then resolved a second time by Chromium — the gap a slow or flaky
+/// attacker-controlled authoritative DNS server used to open.
+///
+/// Known limit: Chromium does its own resolution after this check, so a
+/// name with a 0-TTL record that flips between a public and a private
+/// address (DNS rebinding) can still race it. Closing that fully needs the
+/// browser's traffic to egress through a connect-time-checking proxy; until
+/// then, `[server].allow_private_targets = false` plus a host firewall is the
+/// defence in depth.
+async fn fetch_guard_decision(
+    url_s: &str,
+    is_direct: bool,
+    allow_private: bool,
+    trackers: Option<&HashSet<String>>,
+    dns_cache: Option<&DnsVerdictCache>,
+) -> FetchDecision {
     let Ok(url) = Url::parse(url_s) else {
         // An unparsable "URL" can't be an SSRF vector via cobweb's own network
         // stack either way — let Chromium's own handling deal with it.
         return FetchDecision::Allow;
     };
     match url.scheme() {
-        "http" | "https" => {}
+        "http" | "https" | "ws" | "wss" => {}
         // data:/blob:/chrome-extension:/about:/... never hit the network as an
         // arbitrary host the way http(s) does.
         _ => return FetchDecision::Allow,
     }
-    let Some(host) = url.host_str().map(str::to_string) else {
+    let Some(host) = url.host_str() else {
         return FetchDecision::Allow;
     };
+    if let Some(set) = trackers {
+        if crate::blocklist::host_is_blocked(set, crate::ssrf::strip_brackets(host)) {
+            return FetchDecision::Block("blocklisted tracker/ad domain");
+        }
+    }
     let lower = host.to_ascii_lowercase();
     if !allow_private && (lower == "localhost" || lower.ends_with(".localhost")) {
         return FetchDecision::Block("localhost");
     }
-    if let Ok(ip) = crate::ssrf::strip_brackets(&host).parse::<std::net::IpAddr>() {
+    if let Ok(ip) = crate::ssrf::strip_brackets(host).parse::<std::net::IpAddr>() {
         return match crate::ssrf::block_reason(ip, allow_private) {
             Some(r) => FetchDecision::Block(r),
             None => FetchDecision::Allow,
@@ -1328,133 +1285,285 @@ async fn fetch_guard_decision(url_s: &str, is_direct: bool, allow_private: bool)
         // `ssrf::guard_url`'s direct-egress split.
         return FetchDecision::Allow;
     }
+
+    if let Some(cache) = dns_cache {
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((verdict, at)) = g.get(lower.as_str()) {
+            if at.elapsed() < DNS_CACHE_TTL {
+                return verdict.map_or(FetchDecision::Allow, FetchDecision::Block);
+            }
+        }
+    }
+
     let port = url.port_or_known_default().unwrap_or(0);
-    // Bound to a variable rather than used directly as the tail expression:
-    // the borrow `host.as_str()` needs to outlive the temporary
-    // `lookup_host(...).await` produces, and rustc's temporary-drop-order
-    // rules for a tail expression otherwise drop `host` first.
-    let decision = match tokio::net::lookup_host((host.as_str(), port)).await {
+    let verdict: Option<&'static str> = match tokio::net::lookup_host((lower.as_str(), port)).await
+    {
         Ok(addrs) => {
-            let mut decision = FetchDecision::Allow;
+            let mut verdict = None;
+            let mut any = false;
             for sa in addrs {
+                any = true;
                 if let Some(r) = crate::ssrf::block_reason(sa.ip(), allow_private) {
-                    decision = FetchDecision::Block(r);
+                    verdict = Some(r);
                     break;
                 }
             }
-            decision
+            if any {
+                verdict
+            } else {
+                Some("unresolvable host")
+            }
         }
-        // Can't resolve => can't reach it either; not itself a reason to block.
-        Err(_) => FetchDecision::Allow,
+        Err(_) => Some("unresolvable host"),
     };
-    decision
+    if let Some(cache) = dns_cache {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lower, (verdict, Instant::now()));
+    }
+    verdict.map_or(FetchDecision::Allow, FetchDecision::Block)
 }
 
 /// A hard ceiling on `fetch_guard_decision` so a slow/wedged DNS resolution
 /// never leaves a `Fetch.requestPaused` — and therefore the request itself —
-/// hanging indefinitely: fail *open* (allow) on our own timeout rather than
-/// turn a resolver hiccup into a stuck page load. This does not weaken the
-/// guard for the common case (a literal IP or an already-cached name resolves
-/// well under this).
+/// hanging indefinitely. On expiry the request is **failed**, not allowed:
+/// failing open here was a guard bypass for anyone controlling a slow
+/// authoritative DNS server.
 const FETCH_GUARD_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Spawn the background task that answers every `Fetch.requestPaused` event
-/// belonging to `sessions` (the context's main session plus any adopted
-/// sub-frame) for as long as the returned handle isn't aborted. This is what
-/// actually closes the SSRF gap `ssrf::guard_url` leaves open once a browser
-/// context exists: that guard only ever vets the *entry-point* navigation
-/// URL, never a subresource, a redirect, or a `fetch()`/`XHR` a page's own JS
-/// (including `/v1/eval`'s payload) makes afterwards — all of which go
-/// through Chromium's own network stack.
-///
-/// Deliberately fails open (allows the request) on any internal error/timeout
-/// rather than leaving it paused forever: a bug here should degrade back to
-/// the pre-existing (unguarded) behaviour for that one request, never hang
-/// the page load.
-fn spawn_fetch_guard(
+/// `Target.setAutoAttach` params used for the page and, recursively, every
+/// adopted child: attach children *paused* so they can be instrumented
+/// before they run.
+fn auto_attach_params() -> Value {
+    json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true })
+}
+
+/// Everything the per-context guard task needs, cloned out of `CdpContext`.
+struct GuardCtx {
     client: Arc<CdpClient>,
     sessions: Arc<StdMutex<std::collections::HashSet<String>>>,
     allow_private: bool,
     is_direct: bool,
-) -> tokio::task::JoinHandle<()> {
-    let mut ev = client.subscribe();
+    /// `[blocklist]` domains when the context's `block_trackers` is set.
+    trackers: Option<Arc<HashSet<String>>>,
+    /// Jar-pinned UA override (empty = none), re-applied to every child.
+    ua: String,
+    /// `Network.setBlockedURLs` list (static `BLOCKED_URLS` or empty).
+    blocked_urls: Arc<Vec<String>>,
+    dns_cache: DnsVerdictCache,
+}
+
+impl GuardCtx {
+    fn owns(&self, sid: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(sid)
+    }
+}
+
+/// Spawn the per-context background task that
+///
+/// * answers every `Fetch.requestPaused` belonging to one of the context's
+///   sessions (SSRF guard + `[blocklist]` tracker blocking), and
+/// * adopts every child target auto-attached under one of them: popups are
+///   closed, anything else (cross-site iframe, worker) is registered in
+///   `sessions`, instrumented (`Fetch.enable` first) and only then resumed.
+///
+/// This is what closes the SSRF gap `ssrf::guard_url` leaves open once a
+/// browser context exists: that guard only vets the *entry-point* URL, never
+/// a sub-resource, a redirect, or a `fetch()`/XHR/WebSocket a page's own JS
+/// (including `/v1/eval`'s payload) makes afterwards.
+///
+/// Reads the client's dedicated control channel, which carries only these
+/// two event kinds, so a busy page's `Network.*` flood can't make it lag.
+fn spawn_context_guard(g: GuardCtx) -> tokio::task::JoinHandle<()> {
+    let mut ev = g.client.subscribe_control();
+    let g = Arc::new(g);
     tokio::spawn(async move {
         loop {
             let e = match ev.recv().await {
                 Ok(e) => e,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "browser guard: control stream lagged");
+                    continue;
+                }
                 Err(_) => break, // CDP connection gone
             };
-            if e.method != "Fetch.requestPaused" {
-                continue;
-            }
             let Some(sid) = e.session_id.clone() else {
                 continue;
             };
-            if !sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&sid)
-            {
+            if !g.owns(&sid) {
                 continue;
             }
-            let Some(request_id) = e
-                .params
-                .get("requestId")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            let url_s = e
-                .params
-                .pointer("/request/url")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-
-            // One task per intercepted request so a slow DNS lookup for one
-            // request never delays the continue/fail decision for another
-            // concurrent one — `Fetch.enable` pauses every request, so this
-            // is directly on the page's load-latency critical path.
-            let client = client.clone();
-            tokio::spawn(async move {
-                let decision = tokio::time::timeout(
-                    FETCH_GUARD_TIMEOUT,
-                    fetch_guard_decision(&url_s, is_direct, allow_private),
-                )
-                .await
-                .unwrap_or(FetchDecision::Allow);
-                match decision {
-                    FetchDecision::Block(reason) => {
-                        tracing::warn!(
-                            url = %url_s,
-                            reason,
-                            "browser: blocking a request to a private/internal address"
-                        );
-                        let _ = client
-                            .call_timeout(
-                                "Fetch.failRequest",
-                                json!({ "requestId": request_id, "errorReason": "BlockedByClient" }),
-                                Some(&sid),
-                                Duration::from_secs(5),
-                            )
-                            .await;
-                    }
-                    FetchDecision::Allow => {
-                        let _ = client
-                            .call_timeout(
-                                "Fetch.continueRequest",
-                                json!({ "requestId": request_id }),
-                                Some(&sid),
-                                Duration::from_secs(5),
-                            )
-                            .await;
-                    }
+            match e.method.as_str() {
+                "Fetch.requestPaused" => {
+                    let Some(request_id) = e
+                        .params
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    let url_s = e
+                        .params
+                        .pointer("/request/url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    // One task per intercepted request so a slow DNS lookup
+                    // for one never delays the decision for another.
+                    let g = g.clone();
+                    tokio::spawn(async move {
+                        let decision = tokio::time::timeout(
+                            FETCH_GUARD_TIMEOUT,
+                            fetch_guard_decision(
+                                &url_s,
+                                g.is_direct,
+                                g.allow_private,
+                                g.trackers.as_deref(),
+                                Some(&g.dns_cache),
+                            ),
+                        )
+                        .await
+                        .unwrap_or(FetchDecision::Block("guard timed out"));
+                        answer_paused(&g.client, &sid, request_id, &url_s, decision).await;
+                    });
                 }
-            });
+                "Target.attachedToTarget" => {
+                    let g = g.clone();
+                    let params = e.params.clone();
+                    tokio::spawn(async move { adopt_child(&g, &params).await });
+                }
+                _ => {}
+            }
         }
     })
+}
+
+async fn answer_paused(
+    client: &CdpClient,
+    sid: &str,
+    request_id: String,
+    url_s: &str,
+    decision: FetchDecision,
+) {
+    match decision {
+        FetchDecision::Block(reason) => {
+            tracing::debug!(
+                url = %crate::util::redact_url_str(url_s),
+                reason,
+                "browser: blocking a request"
+            );
+            let _ = client
+                .call_timeout(
+                    "Fetch.failRequest",
+                    json!({ "requestId": request_id, "errorReason": "BlockedByClient" }),
+                    Some(sid),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+        FetchDecision::Allow => {
+            let _ = client
+                .call_timeout(
+                    "Fetch.continueRequest",
+                    json!({ "requestId": request_id }),
+                    Some(sid),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    }
+}
+
+/// Handle one `Target.attachedToTarget` under a session we own.
+async fn adopt_child(g: &GuardCtx, params: &Value) {
+    let ttype = params
+        .pointer("/targetInfo/type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if ttype == "page" || ttype == "tab" {
+        // Popups / new tabs (ad popunders): never wanted, burn RAM, and would
+        // otherwise run un-guarded. Close instead of instrumenting.
+        if let Some(tid) = params
+            .pointer("/targetInfo/targetId")
+            .and_then(Value::as_str)
+        {
+            tracing::debug!(tid, "browser: closing popup target");
+            let _ = g
+                .client
+                .call_timeout(
+                    "Target.closeTarget",
+                    json!({ "targetId": tid }),
+                    None,
+                    Duration::from_secs(2),
+                )
+                .await;
+        }
+        return;
+    }
+    let Some(child) = params.get("sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    // Registered before anything else so the guard recognises the child's
+    // `Fetch.requestPaused` events as soon as they can arrive.
+    g.sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(child.to_string());
+    let s = Some(child);
+    let c = &g.client;
+    // Fetch first and awaited: this is the one that must be in place before
+    // the child is resumed. The rest is best-effort (not every child type
+    // supports every domain — e.g. no `Page` on a worker).
+    let _ = c
+        .call(
+            "Fetch.enable",
+            json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Request" }] }),
+            s,
+        )
+        .await;
+    let ua_fut = async {
+        if !g.ua.is_empty() {
+            let _ = c
+                .call(
+                    "Network.setUserAgentOverride",
+                    json!({ "userAgent": g.ua }),
+                    s,
+                )
+                .await;
+        }
+    };
+    let blocked_fut = async {
+        if !g.blocked_urls.is_empty() {
+            let _ = c
+                .call(
+                    "Network.setBlockedURLs",
+                    json!({ "urls": *g.blocked_urls }),
+                    s,
+                )
+                .await;
+        }
+    };
+    let _ = tokio::join!(
+        c.call("Network.enable", network_enable_params(), s),
+        c.call("Page.enable", json!({}), s),
+        c.call(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": STEALTH_JS }),
+            s,
+        ),
+        c.call("Target.setAutoAttach", auto_attach_params(), s),
+        ua_fut,
+        blocked_fut,
+    );
+    // Paused by `waitForDebuggerOnStart` — resume (does NOT enable Runtime events).
+    let _ = c
+        .call("Runtime.runIfWaitingForDebugger", json!({}), s)
+        .await;
 }
 
 /// Does `url` match the caller's glob set (path, full URL, or last segment)?
@@ -1607,7 +1716,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    fetch_guard_decision(url, true, false).await,
+                    fetch_guard_decision(url, true, false, None, None).await,
                     FetchDecision::Block(_)
                 ),
                 "{url} should be blocked"
@@ -1620,7 +1729,7 @@ mod tests {
         // Mirrors ssrf::guard_url: the literal-IP check is unconditional
         // regardless of is_direct.
         assert!(matches!(
-            fetch_guard_decision("http://127.0.0.1/", false, false).await,
+            fetch_guard_decision("http://127.0.0.1/", false, false, None, None).await,
             FetchDecision::Block(_)
         ));
     }
@@ -1628,11 +1737,50 @@ mod tests {
     #[tokio::test]
     async fn fetch_guard_allows_public_addresses() {
         assert_eq!(
-            fetch_guard_decision("https://1.1.1.1/", true, false).await,
+            fetch_guard_decision("https://1.1.1.1/", true, false, None, None).await,
             FetchDecision::Allow
         );
+        // A hostname on a proxied egress is left to the proxy (no DNS here,
+        // so this stays hermetic).
         assert_eq!(
-            fetch_guard_decision("https://example.com/", true, false).await,
+            fetch_guard_decision("https://example.com/", false, false, None, None).await,
+            FetchDecision::Allow
+        );
+    }
+
+    // Fail-closed: a direct-egress name that doesn't resolve used to be
+    // allowed (and then resolved again by Chromium itself).
+    #[tokio::test]
+    async fn fetch_guard_blocks_an_unresolvable_host_on_direct() {
+        assert!(matches!(
+            fetch_guard_decision("https://nope.invalid/", true, false, None, None).await,
+            FetchDecision::Block(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_guard_blocks_blocklisted_trackers_before_any_dns() {
+        let set: super::HashSet<String> = ["ads.example.com".to_string()].into_iter().collect();
+        assert!(matches!(
+            fetch_guard_decision(
+                "https://x.ads.example.com/p.js",
+                false,
+                false,
+                Some(&set),
+                None
+            )
+            .await,
+            FetchDecision::Block(_)
+        ));
+        assert_eq!(
+            fetch_guard_decision(
+                "https://cdn.example.com/p.js",
+                false,
+                false,
+                Some(&set),
+                None
+            )
+            .await,
             FetchDecision::Allow
         );
     }
@@ -1645,7 +1793,7 @@ mod tests {
             "about:blank",
         ] {
             assert_eq!(
-                fetch_guard_decision(url, true, false).await,
+                fetch_guard_decision(url, true, false, None, None).await,
                 FetchDecision::Allow
             );
         }
@@ -1654,12 +1802,12 @@ mod tests {
     #[tokio::test]
     async fn fetch_guard_respects_allow_private_targets() {
         assert_eq!(
-            fetch_guard_decision("http://10.0.0.5/", true, true).await,
+            fetch_guard_decision("http://10.0.0.5/", true, true, None, None).await,
             FetchDecision::Allow
         );
         // ...but never the always-bogus ranges, same as ssrf::block_reason.
         assert!(matches!(
-            fetch_guard_decision("http://169.254.169.254/", true, true).await,
+            fetch_guard_decision("http://169.254.169.254/", true, true, None, None).await,
             FetchDecision::Block(_)
         ));
     }

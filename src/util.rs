@@ -56,11 +56,25 @@ pub async fn drain_bounded<R: tokio::io::AsyncRead + Unpin>(
         };
         let mut g = sink.lock().unwrap_or_else(|e| e.into_inner());
         g.push_str(&String::from_utf8_lossy(&chunk[..n]));
-        if g.len() > cap {
-            let cut = g.len() - cap;
-            g.drain(..cut);
-        }
+        truncate_front(&mut g, cap);
     }
+}
+
+/// Drop bytes from the front of `s` so it is at most ~`cap` bytes long,
+/// cutting only on a char boundary. A bare `drain(..len - cap)` panics when
+/// the cut lands inside a multi-byte char (e.g. the 3-byte `U+FFFD` that
+/// `from_utf8_lossy` emits for a non-UTF-8 byte) — which killed the stderr
+/// drain task, left the pipe unread, and eventually wedged Chromium on a
+/// blocking write to a full stderr pipe.
+fn truncate_front(s: &mut String, cap: usize) {
+    if s.len() <= cap {
+        return;
+    }
+    let mut cut = s.len() - cap;
+    while cut < s.len() && !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    s.drain(..cut);
 }
 
 /// `url` with its query string and fragment stripped, for logging. Stream/
@@ -73,6 +87,27 @@ pub fn redact_url_query(url: &url::Url) -> String {
     u.set_query(None);
     u.set_fragment(None);
     u.to_string()
+}
+
+/// `url` with any `user:password@` userinfo replaced by `***@`, for error
+/// messages and logs (proxy URLs routinely embed credentials).
+pub fn redact_url_credentials(url: &url::Url) -> String {
+    if url.username().is_empty() && url.password().is_none() {
+        return url.to_string();
+    }
+    let mut u = url.clone();
+    let _ = u.set_password(None);
+    let _ = u.set_username("***");
+    u.to_string()
+}
+
+/// [`redact_url_query`] for a URL still in string form (e.g. from a CDP
+/// event). An unparsable one is cut at the first `?`/`#`.
+pub fn redact_url_str(s: &str) -> String {
+    match url::Url::parse(s) {
+        Ok(u) => redact_url_query(&u),
+        Err(_) => s.split(['?', '#']).next().unwrap_or_default().to_string(),
+    }
 }
 
 /// An upstream failure as a `CobwebError`, safe to log and to hand back to
@@ -260,6 +295,34 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m.get(&"a".to_string()), Some(&10));
         assert_eq!(m.get(&"b".to_string()), Some(&2));
+    }
+
+    #[test]
+    fn truncate_front_never_splits_a_char() {
+        // "é" is 2 bytes, "\u{FFFD}" 3: every cut position must be survivable.
+        for cap in 0..12 {
+            let mut s = String::from("aé\u{FFFD}bé\u{FFFD}");
+            truncate_front(&mut s, cap);
+            assert!(s.len() <= cap.max(1) + 2, "cap {cap}: {s:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_bounded_survives_non_utf8_input() {
+        let input: Vec<u8> = (0..10_000u32).map(|i| (i % 256) as u8).collect();
+        let sink = Arc::new(Mutex::new(String::new()));
+        drain_bounded(&input[..], sink.clone(), 101).await;
+        assert!(sink.lock().unwrap().len() <= 103);
+    }
+
+    #[test]
+    fn redact_url_credentials_hides_userinfo() {
+        let u = url::Url::parse("socks5://alice:s3cret@proxy.example:1080").unwrap();
+        let r = redact_url_credentials(&u);
+        assert!(!r.contains("s3cret") && !r.contains("alice"), "{r}");
+        assert!(r.contains("proxy.example:1080"));
+        let plain = url::Url::parse("http://proxy.example:3128").unwrap();
+        assert_eq!(redact_url_credentials(&plain), "http://proxy.example:3128/");
     }
 
     #[test]

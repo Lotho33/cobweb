@@ -62,14 +62,32 @@ impl JarEntry {
             accept_language: String::new(),
             created: Utc::now(),
             last_ok: None,
-            ttl_hint_secs,
+            ttl_hint_secs: clamp_ttl_secs(ttl_hint_secs),
             fail_streak: 0,
         }
     }
 
+    /// `created + ttl_hint_secs`, with the TTL clamped to [`MAX_TTL_SECS`].
+    /// `ttl_hint_secs` can come from an upstream `Set-Cookie: Max-Age=…` (or a
+    /// jar file written before the clamp existed): an unchecked
+    /// `Duration::seconds(huge)` / `DateTime + Duration` panics, which used to
+    /// turn one hostile cookie into a persisted 500 on every `GET /v1/jar`.
     fn expiry(&self) -> DateTime<Utc> {
-        self.created + chrono::Duration::seconds(self.ttl_hint_secs as i64)
+        let secs = clamp_ttl_secs(self.ttl_hint_secs) as i64;
+        chrono::TimeDelta::try_seconds(secs)
+            .and_then(|d| self.created.checked_add_signed(d))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
     }
+}
+
+/// Upper bound on any jar/session TTL (30 days). Far above a real
+/// `cf_clearance` lifetime, far below anything that overflows `chrono`.
+pub const MAX_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Clamp a TTL (from a cookie `Max-Age`, a settings PATCH, …) to
+/// [`MAX_TTL_SECS`].
+pub fn clamp_ttl_secs(secs: u64) -> u64 {
+    secs.min(MAX_TTL_SECS)
 }
 
 /// Lightweight row for `GET /v1/jar`.
@@ -420,6 +438,21 @@ mod tests {
         let after = jar.load("x.to", &mullvad()).await.unwrap();
         assert_eq!(after.fail_streak, 0);
         assert!(after.last_ok.is_some());
+    }
+
+    // Regression: a hostile `Max-Age=9000000000000000000` (or a jar file
+    // written before the clamp) used to panic in `expiry()` on every read.
+    #[tokio::test]
+    async fn huge_ttl_does_not_panic_and_is_clamped() {
+        let (_d, jar) = tmp_jar();
+        let mut e = JarEntry::new("big.to", "direct", u64::MAX);
+        assert_eq!(e.ttl_hint_secs, MAX_TTL_SECS);
+        e.ttl_hint_secs = u64::MAX; // as if loaded from an old jar file
+        jar.save(&e).await.unwrap();
+        assert!(!jar.is_stale(&e));
+        let rows = jar.list().await;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].expires_at <= Utc::now() + chrono::Duration::days(31));
     }
 
     #[tokio::test]

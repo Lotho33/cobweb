@@ -121,7 +121,10 @@ impl AppState {
             settings.jar_fail_streak(),
         );
 
-        let blocklist = Arc::new(Blocklist::new(config.blocklist.clone()));
+        let blocklist = Arc::new(
+            Blocklist::new(config.blocklist.clone())
+                .with_allow_private_targets(config.server.allow_private_targets),
+        );
 
         let browser: Option<Arc<dyn BrowserEngine>> = match config.server.browser_engine {
             EngineKind::None => None,

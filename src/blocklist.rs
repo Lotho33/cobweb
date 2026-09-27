@@ -10,11 +10,18 @@
 //! (`src/browser/cdp_engine.rs`): this pulls domains from hosts-format /
 //! simple Adblock lists over HTTP. Each source's last successfully parsed
 //! domain list is persisted alongside it (`BlocklistSource::domains`), so
-//! toggling/removing a source recomputes the merged pattern set locally,
-//! with no network fetch. The resulting glob patterns feed the same
-//! `Network.setBlockedURLs` call `block_resources` already uses.
+//! toggling/removing a source recomputes the merged domain set locally,
+//! with no network fetch.
+//!
+//! The merged set is enforced by the browser tier's Fetch-domain guard
+//! (`src/browser/cdp_engine.rs`), which already pauses every request: a
+//! per-request `HashSet` lookup per host suffix ([`Blocklist::is_blocked`]).
+//! It used to be expanded into two glob patterns per domain and pushed via
+//! `Network.setBlockedURLs` — with real lists (100k+ domains) that meant
+//! cloning and shipping MBs of JSON on every context/sub-frame, and Chromium
+//! linearly matching every request against 200k+ globs.
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
@@ -154,14 +161,16 @@ struct BlocklistState {
 
 /// Runtime-managed blocklist. `state` (sources + master switch) is mutated
 /// through the `add_source`/`set_*`/`remove_source` API below and persisted
-/// to `cfg.state_path` on every change; `patterns` is the compiled glob-set
+/// to `cfg.state_path` on every change; `domains` is the merged domain-set
 /// snapshot `CdpEngine` reads on every context acquire — kept in a separate,
 /// synchronous lock so a hot-path read never contends with an admin mutation
 /// or a background refresh.
 pub struct Blocklist {
     cfg: BlocklistConfig,
     state: AsyncMutex<BlocklistState>,
-    patterns: StdRwLock<Arc<Vec<String>>>,
+    domains: StdRwLock<Arc<HashSet<String>>>,
+    /// `[server].allow_private_targets`, for the SSRF check on source URLs.
+    allow_private_targets: bool,
 }
 
 impl Blocklist {
@@ -181,20 +190,48 @@ impl Blocklist {
                 "blocklist: loaded persisted state"
             );
         }
-        let patterns = compute_patterns(&state, &cfg.extra_domains, &cfg.allow_domains);
+        let domains = compute_domains(&state, &cfg.extra_domains, &cfg.allow_domains);
         Self {
             cfg,
             state: AsyncMutex::new(state),
-            patterns: StdRwLock::new(Arc::new(patterns)),
+            domains: StdRwLock::new(Arc::new(domains)),
+            allow_private_targets: false,
         }
     }
 
-    /// Cheap read for `CdpEngine` — never touches `state`'s async lock.
-    pub fn snapshot(&self) -> Arc<Vec<String>> {
-        self.patterns
+    /// Mirror `[server].allow_private_targets` for source-URL fetches
+    /// (default: private/loopback source hosts are refused).
+    pub fn with_allow_private_targets(mut self, allow: bool) -> Self {
+        self.allow_private_targets = allow;
+        self
+    }
+
+    /// Cheap read for `CdpEngine` (one `Arc` clone) — never touches `state`'s
+    /// async lock. Match against it with [`host_is_blocked`].
+    pub fn domain_set(&self) -> Arc<HashSet<String>> {
+        self.domains
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Is `host` (or any parent domain of it) on the merged list?
+    pub fn is_blocked(&self, host: &str) -> bool {
+        host_is_blocked(&self.domain_set(), host)
+    }
+
+    /// The merged set expanded to glob patterns (see [`domain_to_patterns`]).
+    /// Diagnostic/test view only — not on any hot path.
+    pub fn snapshot(&self) -> Arc<Vec<String>> {
+        let set = self.domain_set();
+        let mut domains: Vec<&String> = set.iter().collect();
+        domains.sort();
+        Arc::new(
+            domains
+                .into_iter()
+                .flat_map(|d| domain_to_patterns(d))
+                .collect(),
+        )
     }
 
     pub async fn status(&self) -> BlocklistStatusView {
@@ -205,7 +242,8 @@ impl Blocklist {
     fn status_locked(&self, state: &BlocklistState) -> BlocklistStatusView {
         BlocklistStatusView {
             enabled: state.enabled,
-            pattern_count: self.snapshot().len(),
+            // Wire-compatible with the old glob expansion (2 per domain).
+            pattern_count: self.domain_set().len() * 2,
             sources: state
                 .sources
                 .iter()
@@ -235,7 +273,8 @@ impl Blocklist {
     ) -> Result<BlocklistSourceView> {
         Url::parse(&url)
             .map_err(|e| CobwebError::BadRequest(format!("blocklist source url: {e}")))?;
-        let (domains, last_error) = match fetch_source(fast, &url).await {
+        let (domains, last_error) = match fetch_source(fast, &url, self.allow_private_targets).await
+        {
             Ok(body) => (parse_list(&body), None),
             Err(e) => (Vec::new(), Some(e.to_string())),
         };
@@ -307,7 +346,7 @@ impl Blocklist {
         }
         let mut results = Vec::with_capacity(targets.len());
         for (id, url) in targets {
-            let result = fetch_source(fast, &url).await;
+            let result = fetch_source(fast, &url, self.allow_private_targets).await;
             match &result {
                 Ok(body) => {
                     tracing::debug!(source = %url, count = parse_list(body).len(), "blocklist: refreshed source");
@@ -341,8 +380,8 @@ impl Blocklist {
     /// either way, so a disk hiccup here degrades to "forgets on restart",
     /// not "blocklist stops working".
     async fn recompute_and_persist(&self, state: &mut BlocklistState) {
-        let patterns = compute_patterns(state, &self.cfg.extra_domains, &self.cfg.allow_domains);
-        *self.patterns.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(patterns);
+        let domains = compute_domains(state, &self.cfg.extra_domains, &self.cfg.allow_domains);
+        *self.domains.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(domains);
         if let Err(e) = persist_json(&self.cfg.state_path, &*state).await {
             tracing::warn!(error = %e, "blocklist: failed to persist state");
         }
@@ -362,11 +401,38 @@ impl Blocklist {
     }
 }
 
-fn compute_patterns(state: &BlocklistState, extra: &[String], allow: &[String]) -> Vec<String> {
-    if !state.enabled {
-        return Vec::new();
+/// `host` itself or any of its parent domains is in `set` — the same
+/// coverage `domain_to_patterns` gave (a domain plus every subdomain), in
+/// O(labels) hash lookups instead of a linear glob scan.
+pub fn host_is_blocked(set: &HashSet<String>, host: &str) -> bool {
+    if set.is_empty() {
+        return false;
     }
-    let mut domains: BTreeSet<String> = extra
+    let host = host.trim_end_matches('.');
+    let lower;
+    let host = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        lower = host.to_ascii_lowercase();
+        lower.as_str()
+    } else {
+        host
+    };
+    let mut rest = host;
+    loop {
+        if set.contains(rest) {
+            return true;
+        }
+        match rest.split_once('.') {
+            Some((_, parent)) => rest = parent,
+            None => return false,
+        }
+    }
+}
+
+fn compute_domains(state: &BlocklistState, extra: &[String], allow: &[String]) -> HashSet<String> {
+    if !state.enabled {
+        return HashSet::new();
+    }
+    let mut domains: HashSet<String> = extra
         .iter()
         .map(|d| d.trim().to_ascii_lowercase())
         .filter(|d| !d.is_empty())
@@ -377,13 +443,21 @@ fn compute_patterns(state: &BlocklistState, extra: &[String], allow: &[String]) 
     for a in allow {
         domains.remove(a.trim().to_ascii_lowercase().as_str());
     }
-    domains.iter().flat_map(|d| domain_to_patterns(d)).collect()
+    domains
 }
 
-async fn fetch_source(fast: &Arc<dyn FastClient>, src: &str) -> Result<String> {
+async fn fetch_source(
+    fast: &Arc<dyn FastClient>,
+    src: &str,
+    allow_private: bool,
+) -> Result<String> {
     let url = Url::parse(src).map_err(|e| {
         CobwebError::Config(format!("blocklist source `{src}` is not a valid URL: {e}"))
     })?;
+    // The fast client's resolver vets hostnames, but never sees an IP
+    // literal (`http://169.254.169.254/…`) or a non-http scheme — run the
+    // same entry-point guard every other outbound fetch uses.
+    crate::ssrf::guard_url(&url, true, allow_private).await?;
     let egress = Egress::direct();
     let resp = fast
         .fetch(FetchRequest {
@@ -455,6 +529,28 @@ mod tests {
     fn skips_placeholders_and_dotless_entries() {
         let text = "0.0.0.0 localhost\n0.0.0.0 broadcasthost\nlocalhost.localdomain\nnodot\n";
         assert!(parse_list(text).is_empty());
+    }
+
+    #[test]
+    fn host_is_blocked_matches_domain_and_subdomains_only() {
+        let set: HashSet<String> = ["ads.example.com".to_string()].into_iter().collect();
+        assert!(host_is_blocked(&set, "ads.example.com"));
+        assert!(host_is_blocked(&set, "x.y.ADS.example.com."));
+        assert!(!host_is_blocked(&set, "example.com"));
+        assert!(!host_is_blocked(&set, "badads.example.com"));
+        assert!(!host_is_blocked(&HashSet::new(), "ads.example.com"));
+    }
+
+    #[tokio::test]
+    async fn add_source_refuses_a_private_literal_ip() {
+        let fast = FakeFast::arc(HashMap::new());
+        let bl = Blocklist::new(cfg());
+        let view = bl
+            .add_source("http://169.254.169.254/latest/meta-data/".into(), &fast)
+            .await
+            .unwrap();
+        let err = view.last_error.expect("must be refused");
+        assert!(err.contains("blocked"), "{err}");
     }
 
     #[test]

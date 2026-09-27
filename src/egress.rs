@@ -42,7 +42,9 @@ impl Egress {
         let url = Url::parse(raw)
             .map_err(|_| CobwebError::BadRequest(format!("proxy_url is not a valid URL: {raw}")))?;
         Ok(Self {
-            name: format!("raw:{raw}"),
+            // Surfaces in errors/logs (`EgressUnavailable { name }`) and keys
+            // the health cache — credentials stripped, host:port kept distinct.
+            name: format!("raw:{}", crate::util::redact_url_credentials(&url)),
             proxy: Some(url),
         })
     }
@@ -195,7 +197,13 @@ impl EgressRegistry {
         } else {
             Err(CobwebError::EgressUnavailable {
                 name: e.name.clone(),
-                reason: format!("cannot connect to proxy {proxy}"),
+                // Never echo the URL as-is: an `[egress.*]` proxy routinely
+                // carries `user:pass@`, and this error is both returned to the
+                // caller and logged at `error`.
+                reason: format!(
+                    "cannot connect to proxy {}",
+                    crate::util::redact_url_credentials(proxy)
+                ),
             })
         }
     }

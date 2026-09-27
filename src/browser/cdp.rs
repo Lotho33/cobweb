@@ -40,6 +40,13 @@ pub struct CdpClient {
     outbound: mpsc::UnboundedSender<Message>,
     pending: Pending,
     events: broadcast::Sender<CdpEvent>,
+    /// Low-volume control events the per-context guard task acts on
+    /// ([`is_control_event`]). Kept off `events` so the flood of
+    /// `Network.*` traffic on a busy page can never make the guard *lag*
+    /// and silently drop one: a lost `Fetch.requestPaused` hangs that
+    /// request forever, a lost `Target.attachedToTarget` leaves a paused
+    /// sub-frame un-instrumented.
+    control: broadcast::Sender<CdpEvent>,
     _reader: tokio::task::JoinHandle<()>,
     _writer: tokio::task::JoinHandle<()>,
 }
@@ -53,6 +60,7 @@ impl CdpClient {
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (events_tx, _) = broadcast::channel(1024);
+        let (control_tx, _) = broadcast::channel(8192);
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
 
         let writer = tokio::spawn(async move {
@@ -65,6 +73,7 @@ impl CdpClient {
 
         let pending_r = pending.clone();
         let events_r = events_tx.clone();
+        let control_r = control_tx.clone();
         let reader = tokio::spawn(async move {
             while let Some(frame) = stream.next().await {
                 let msg = match frame {
@@ -109,7 +118,12 @@ impl CdpClient {
                         .and_then(Value::as_str)
                         .map(str::to_string);
                     let params = v.get_mut("params").map(Value::take).unwrap_or(Value::Null);
-                    let _ = events_r.send(CdpEvent {
+                    let tx = if is_control_event(&method) {
+                        &control_r
+                    } else {
+                        &events_r
+                    };
+                    let _ = tx.send(CdpEvent {
                         method,
                         params: Arc::new(params),
                         session_id,
@@ -127,6 +141,7 @@ impl CdpClient {
             outbound: out_tx,
             pending,
             events: events_tx,
+            control: control_tx,
             _reader: reader,
             _writer: writer,
         }))
@@ -136,6 +151,13 @@ impl CdpClient {
     /// the events you want, or you'll race them.
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
         self.events.subscribe()
+    }
+
+    /// Stream of control events only (`Fetch.requestPaused`,
+    /// `Target.attachedToTarget`) — see [`is_control_event`]. These never
+    /// appear on [`subscribe`](Self::subscribe).
+    pub fn subscribe_control(&self) -> broadcast::Receiver<CdpEvent> {
+        self.control.subscribe()
     }
 
     /// Fire-and-forget a command: no reply is awaited, no `pending` slot is held.
@@ -203,6 +225,11 @@ impl CdpClient {
             }
         }
     }
+}
+
+/// Events routed to the dedicated control channel instead of the general one.
+pub fn is_control_event(method: &str) -> bool {
+    matches!(method, "Fetch.requestPaused" | "Target.attachedToTarget")
 }
 
 /// High-frequency CDP events that no consumer in this crate subscribes to
