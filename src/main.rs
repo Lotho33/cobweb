@@ -94,6 +94,27 @@ async fn run() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if let Some(k) = cfg.server.effective_api_key() {
+        if k.len() < 24 {
+            tracing::warn!(
+                len = k.len(),
+                "[server].api_key is short; use at least 32 random characters (e.g. `openssl rand -hex 32`)"
+            );
+        }
+    }
+    for (name, e) in &cfg.egress {
+        if e.proxy.trim_start().starts_with("socks5://")
+            || e.proxy.trim_start().starts_with("socks4://")
+        {
+            tracing::warn!(
+                egress = %name,
+                "proxy uses socks5:// / socks4://: target names are resolved LOCALLY, so DNS \
+                 queries bypass the proxy (a DNS leak for a VPN exit). Use socks5h:// to \
+                 resolve at the proxy."
+            );
+        }
+    }
+
     let addr = cfg.server.listen_addr();
     let has_api_key = cfg.server.effective_api_key().is_some();
     if !addr.ip().is_loopback() && !has_api_key {

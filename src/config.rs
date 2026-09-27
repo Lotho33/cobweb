@@ -360,6 +360,14 @@ impl Config {
                 })?;
             }
         }
+        // FlareSolverr sessions are jar entries under the egress key `fs`
+        // (`api/flaresolverr.rs`): a profile of that name would share their
+        // jar files.
+        if self.egress.contains_key("fs") {
+            return Err(CobwebError::Config(
+                "egress profile name `fs` is reserved (FlareSolverr session jar key)".into(),
+            ));
+        }
         if self.server.max_contexts == 0 {
             return Err(CobwebError::Config(
                 "server.max_contexts must be >= 1".into(),
@@ -483,6 +491,13 @@ mod tests {
         let cfg =
             Config::parse("[server]\nbind = \"0.0.0.0\"\n[egress.direct]\nproxy = \"\"\n").unwrap();
         assert_eq!(cfg.server.listen_addr(), "0.0.0.0:8191".parse().unwrap());
+    }
+
+    #[test]
+    fn rejects_reserved_fs_egress_name() {
+        let err = Config::parse("[egress.direct]\nproxy = \"\"\n[egress.fs]\nproxy = \"\"\n")
+            .unwrap_err();
+        assert!(matches!(err, CobwebError::Config(_)));
     }
 
     #[test]

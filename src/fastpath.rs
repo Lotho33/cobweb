@@ -142,10 +142,19 @@ impl WreqClient {
             // a field that promised behaviour the code didn't have.
             .emulation(wreq_util::Profile::Chrome147)
             // SSRF guard: resolve + vet every address, re-run on each redirect.
-            .dns_resolver(crate::ssrf::GuardedResolver::new(
-                self.allow_private_targets,
-                self.settings.clone(),
-            ))
+            .dns_resolver({
+                let r = crate::ssrf::GuardedResolver::new(
+                    self.allow_private_targets,
+                    self.settings.clone(),
+                );
+                // `wreq` resolves the proxy host through this same resolver;
+                // an operator-configured profile's proxy is trusted (see
+                // `GuardedResolver`'s doc), a raw request `proxy_url` is not.
+                match egress.proxy.as_ref().and_then(|p| p.host_str()) {
+                    Some(h) if !egress.name.starts_with("raw:") => r.trusting_proxy_host(h),
+                    _ => r,
+                }
+            })
             // Keep sockets to the same origin warm across the repeated calls a
             // single resolve makes (player HTML, then the manifest probe).
             .pool_idle_timeout(Duration::from_secs(90))

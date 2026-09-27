@@ -649,3 +649,56 @@ async fn foreign_host_header_is_refused_without_an_api_key() {
         .unwrap();
     assert_eq!(ok.status().as_u16(), 200);
 }
+
+// Regression: `wreq` connects to the *proxy* through the client's DNS
+// resolver, i.e. the SSRF `GuardedResolver`. An operator-configured profile
+// whose proxy lives at a private/loopback address (the usual
+// `socks5://mullvad:1080` Compose service name) was therefore refused as a
+// "private target" under the default `allow_private_targets = false`, making
+// every named proxy profile unusable on the fast path.
+#[tokio::test]
+async fn named_egress_proxy_on_a_private_host_is_usable() {
+    // A plain-HTTP forward proxy is just an HTTP server that receives
+    // absolute-form request targets — wiremock matches on the path.
+    let proxy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/page"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("via proxy"))
+        .mount(&proxy)
+        .await;
+    let jar_dir = tempfile::tempdir().unwrap();
+    let cfg = Config::parse(&format!(
+        r#"
+        [server]
+        port = 0
+        browser_engine = "none"
+        allow_private_targets = false
+        [jar]
+        path = {:?}
+        [egress.direct]
+        proxy = ""
+        [egress.lan]
+        proxy = "http://localhost:{}"
+        "#,
+        jar_dir.path(),
+        proxy.address().port()
+    ))
+    .unwrap();
+    let state = AppState::from_config(cfg).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = cobweb::serve_on(state, listener).await;
+    });
+
+    let resp = wreq::Client::new()
+        .post(format!("http://{addr}/v1/navigate"))
+        .json(&json!({ "url": "http://stream.example.test/page", "egress": "lan" }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["html"], "via proxy");
+}

@@ -365,10 +365,21 @@ pub fn redirect_policy(allow_private: bool) -> wreq::redirect::Policy {
 /// re-applied on each redirect hop (`wreq` calls the resolver again for every
 /// new connection) *and* against whatever `[settings].dns_servers`
 /// (`src/settings.rs`) currently point at, live.
+///
+/// `wreq` also resolves the *proxy's* host through this resolver when an
+/// egress has one (SOCKS and HTTP-CONNECT connectors alike). The host of an
+/// operator-configured `[egress.*]` proxy is therefore exempt
+/// ([`GuardedResolver::trusting_proxy_host`]) — it routinely lives on a
+/// private network (`socks5://mullvad:1080`) and the operator owns it, same
+/// policy as [`guard_egress`]. A caller-supplied raw `proxy_url` gets no
+/// exemption, which also re-vets its host at connect time (closing the
+/// rebinding window after `guard_egress`'s own lookup).
 #[derive(Clone)]
 pub struct GuardedResolver {
     settings: Arc<RuntimeSettings>,
     allow_private: bool,
+    /// Lower-cased host name exempt from the address check (see above).
+    trusted_host: Option<Arc<str>>,
 }
 
 impl GuardedResolver {
@@ -376,7 +387,15 @@ impl GuardedResolver {
         Self {
             settings,
             allow_private,
+            trusted_host: None,
         }
+    }
+
+    /// Exempt `host` — an operator-configured proxy's host — from the
+    /// private-address check.
+    pub fn trusting_proxy_host(mut self, host: &str) -> Self {
+        self.trusted_host = Some(strip_brackets(host).to_ascii_lowercase().into());
+        self
     }
 }
 
@@ -392,7 +411,11 @@ async fn gai_resolve(name: wreq::dns::Name) -> Result<Vec<SocketAddr>, tower::Bo
 impl wreq::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
         let dns = self.settings.dns_snapshot();
-        let allow_private = self.allow_private;
+        let trusted = self
+            .trusted_host
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(name.as_str()));
+        let allow_private = self.allow_private || trusted;
         Box::pin(async move {
             let host = name.as_str().to_owned();
             let addrs: Vec<SocketAddr> = match &dns.backend {
@@ -663,6 +686,20 @@ mod tests {
                 .is_ok(),
             "allow_private_targets = true must let a loopback resolution through"
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_resolver_trusts_only_the_configured_proxy_host() {
+        use wreq::dns::{Name, Resolve};
+        let settings = system_only_settings().await;
+        let r = GuardedResolver::new(false, settings).trusting_proxy_host("LOCALHOST");
+        assert!(Resolve::resolve(&r, Name::from("localhost")).await.is_ok());
+        // Trusting a *different* name leaves `localhost` refused.
+        let other = GuardedResolver::new(false, system_only_settings().await)
+            .trusting_proxy_host("mullvad");
+        assert!(Resolve::resolve(&other, Name::from("localhost"))
+            .await
+            .is_err());
     }
 
     // Proves the fallback this whole design exists for (see `src/settings.rs`'s
