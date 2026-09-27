@@ -1,5 +1,5 @@
 //! Small helpers shared across `browser/*` and other modules that used to be
-//! reimplemented per-module (`which`, `free_port`, a bounded stderr drain) plus
+//! reimplemented per-module (`which`, a bounded stderr drain) plus
 //! a capped map for counters keyed by caller-influenced strings (domains, raw
 //! `proxy_url`s) so a long-running process — or an unauthenticated caller
 //! feeding it many distinct keys — can't grow a `HashMap` (and `/metrics`'s
@@ -27,16 +27,6 @@ pub fn which(name: &str) -> Option<PathBuf> {
             .map(|dir| dir.join(name))
             .find(|p| p.is_file())
     })
-}
-
-/// Bind an ephemeral loopback port and hand back the number, for a subprocess
-/// we're about to launch with `--port=<n>` (or equivalent). There is an
-/// inherent TOCTOU window between this and the subprocess's own bind — bounded
-/// on a host that isn't itself running an adversarial process racing us for
-/// ports, which matches this sidecar's single-tenant deployment model.
-pub fn free_port() -> std::io::Result<u16> {
-    let l = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
 }
 
 /// Drain a child process's stdout/stderr into a bounded, shared buffer (so a

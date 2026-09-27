@@ -163,9 +163,17 @@ impl CdpEngine {
 
     async fn launched(&self) -> BrowserResult<(Arc<CdpClient>, String)> {
         let mut g = self.launched.lock().await;
+        if let Some(l) = g.as_mut() {
+            if !l.chromium.is_alive() {
+                tracing::warn!("Chromium exited or lost its CDP connection; relaunching");
+                if let Some(dead) = g.take() {
+                    dead.chromium.kill().await;
+                }
+            }
+        }
         if g.is_none() {
             let chromium = Chromium::launch(&self.cfg, self.max_contexts).await?;
-            let client = CdpClient::connect(&chromium.ws_url).await?;
+            let client = chromium.client.clone();
             let default_ua = chromium.user_agent.clone();
             tracing::info!(ua = %default_ua, "Chromium + CDP ready");
             *g = Some(Launched {

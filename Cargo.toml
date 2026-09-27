@@ -37,7 +37,7 @@ ytdlp        = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "time", "sync", "net", "process", "io-util"] }
-axum = { version = "0.8", features = ["json", "tokio", "http1", "ws"] }
+axum = { version = "0.8", features = ["json", "tokio", "http1"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "limit", "catch-panic", "fs"] }
 
@@ -61,9 +61,9 @@ psl = "2"
 # instances rather than wreq's bundled singleton wrapper.
 hickory-resolver = "0.26"
 
-# Hand-rolled CDP client transport (DESIGN.md §3) — plaintext ws://127.0.0.1, no TLS.
-tokio-tungstenite = "0.23"
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# CDP runs over `--remote-debugging-pipe` (src/browser/cdp.rs) — no WebSocket
+# client needed.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 base64 = "0.22"   # decode CDP getResponseBody payloads for the body sniff
 libc = "0.2"      # kill the Chromium process *group* on teardown (no orphans)
 
