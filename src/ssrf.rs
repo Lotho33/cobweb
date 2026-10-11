@@ -1,11 +1,13 @@
 //! SSRF guard.
 //!
-//! Every request cobweb makes on a caller's behalf goes through here first: the
-//! target host is resolved and any address that is not globally routable —
-//! loopback, RFC1918, link-local (incl. the `169.254.169.254` cloud-metadata
-//! endpoint), CGNAT, IPv6 ULA, and friends — is refused. On the fast path the
-//! same check is installed as the `wreq` DNS resolver ([`GuardedResolver`]), so
-//! it re-runs on every redirect hop as well.
+//! Every request cobweb makes on a caller's behalf is vetted here: any address
+//! that is not globally routable — loopback, RFC1918, link-local (incl. the
+//! `169.254.169.254` cloud-metadata endpoint), CGNAT, IPv6 ULA, and friends —
+//! is refused. Hostnames are checked where they are resolved and connected
+//! to: on the fast path by the `wreq` DNS resolver ([`GuardedResolver`], which
+//! re-runs on every redirect hop), in the browser by its connect-time egress
+//! proxy ([`vetted_socket_addrs`]). The entry point ([`guard_url`]) only does
+//! the DNS-free part, so a request costs one lookup, not two.
 //!
 //! Two tiers of "bad":
 //!   * **hard-blocked** — `0.0.0.0` / `::`, `169.254.169.254`, multicast,
@@ -176,13 +178,20 @@ pub fn block_reason(ip: IpAddr, allow_private: bool) -> Option<&'static str> {
 
 /// Guard a target URL before fetching it.
 ///
-/// * `is_direct` — whether the chosen egress is `direct`. DNS resolution is only
-///   checked for direct egress; a proxied egress resolves at the proxy.
-/// * `allow_private` — `[server].allow_private_targets`.
+/// Enforced on any egress: the scheme must be http/https, and a literal
+/// non-global IP or `localhost` in the URL is refused (`allow_private` =
+/// `[server].allow_private_targets`).
 ///
-/// Always enforced (any egress): the scheme must be http/https, and a literal
-/// non-global IP or `localhost` in the URL is refused.
-pub async fn guard_url(url: &Url, is_direct: bool, allow_private: bool) -> Result<()> {
+/// Hostnames are deliberately *not* resolved here. Every connection that
+/// follows re-resolves and vets them anyway — [`GuardedResolver`] on the fast
+/// path, the browser's egress proxy ([`vetted_socket_addrs`]) for a `direct`
+/// browser context — and a proxied egress resolves at the proxy. A lookup
+/// here was pure overhead with no security value (a rebinding record can flip
+/// between it and the connect): a second query per request, and through the
+/// *system* resolver rather than `[settings].dns_servers`, so a rate-limited
+/// LAN resolver (AdGuard/Pi-hole) dropping it stalled `/v1/fetch` for the
+/// glibc retransmit (~5 s) on every segment.
+pub fn guard_url(url: &Url, allow_private: bool) -> Result<()> {
     match url.scheme() {
         "http" | "https" => {}
         other => {
@@ -196,45 +205,10 @@ pub async fn guard_url(url: &Url, is_direct: bool, allow_private: bool) -> Resul
         .host_str()
         .ok_or_else(|| CobwebError::BadRequest(format!("URL has no host: {url}")))?;
 
-    let lower = host.to_ascii_lowercase();
-    if !allow_private && (lower == "localhost" || lower.ends_with(".localhost")) {
-        return Err(CobwebError::Blocked(format!(
-            "refusing to fetch `{host}`: localhost"
-        )));
+    match redirect_block_reason(host, allow_private) {
+        Some(reason) => Err(blocked(host, reason)),
+        None => Ok(()),
     }
-
-    // A literal IP in the URL: classify without touching DNS, on every egress.
-    if let Ok(ip) = strip_brackets(host).parse::<IpAddr>() {
-        if let Some(reason) = block_reason(ip, allow_private) {
-            return Err(blocked(host, reason));
-        }
-        return Ok(());
-    }
-
-    if !is_direct {
-        return Ok(());
-    }
-
-    // Hostname on the direct egress: resolve and classify every A/AAAA. Reject
-    // if *any* is non-global — a name that straddles public and private space
-    // is a DNS-rebinding lure.
-    //
-    // A resolution *failure* is not treated as "blocked" here: the fetch can't
-    // reach the host either, and on the fast path [`GuardedResolver`] re-checks
-    // at connect time anyway. Only an address that actually resolves and is
-    // non-global is refused.
-    let port = url.port_or_known_default().unwrap_or(0);
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => {
-            for sa in addrs {
-                if let Some(reason) = block_reason(sa.ip(), allow_private) {
-                    return Err(blocked(host, reason));
-                }
-            }
-        }
-        Err(e) => tracing::debug!(%host, error = %e, "ssrf guard: could not resolve target"),
-    }
-    Ok(())
 }
 
 /// `url::Url::host_str()` includes the surrounding brackets for an IPv6
@@ -295,9 +269,8 @@ pub async fn guard_egress(egress: &crate::egress::Egress, allow_private: bool) -
         return Ok(());
     }
 
-    // A hostname proxy: resolve and vet every address, same rationale as
-    // `guard_url`'s direct-egress branch — a resolution failure is not itself
-    // "blocked" (the connect that follows can't reach it either).
+    // A hostname proxy: resolve and vet every address — a resolution failure
+    // is not itself "blocked" (the connect that follows can't reach it either).
     let port = proxy.port_or_known_default().unwrap_or(0);
     match tokio::net::lookup_host((host, port)).await {
         Ok(addrs) => {
@@ -317,9 +290,10 @@ pub async fn guard_egress(egress: &crate::egress::Egress, allow_private: bool) -
 /// Resolve `host:port` and vet every address — the connect-time check the
 /// browser's egress proxy (`browser::egress_proxy`) runs, so the address it
 /// then connects to is exactly the one that was checked (no second lookup
-/// for a rebinding record to flip). Same rules as [`guard_url`]'s
-/// direct-egress branch: literal IPs classified directly, `localhost` names
-/// refused unless relaxed, and *any* non-global answer refuses the name.
+/// for a rebinding record to flip). Literal IPs are classified directly,
+/// `localhost` names refused unless relaxed, and *any* non-global answer
+/// refuses the name (one that straddles public and private space is a
+/// DNS-rebinding lure).
 /// Resolution uses the live `[settings].dns_servers` backend (system
 /// resolver on failure, as in [`GuardedResolver`]) when `settings` is given.
 pub async fn vetted_socket_addrs(
@@ -561,16 +535,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn guard_url_rejects_literals_on_any_egress() {
+    #[test]
+    fn guard_url_rejects_literals() {
         let u = Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
-        // even a proxied egress (is_direct = false) rejects the metadata literal
-        assert!(guard_url(&u, false, false).await.is_err());
-        assert!(guard_url(&u, false, true).await.is_err());
+        // the metadata literal is refused even when private targets are allowed
+        assert!(guard_url(&u, false).is_err());
+        assert!(guard_url(&u, true).is_err());
 
         let lo = Url::parse("http://127.0.0.1:8096/x").unwrap();
-        assert!(guard_url(&lo, true, false).await.is_err());
-        assert!(guard_url(&lo, true, true).await.is_ok());
+        assert!(guard_url(&lo, false).is_err());
+        assert!(guard_url(&lo, true).is_ok());
     }
 
     // Regression: `Url::host_str()` keeps the brackets for an IPv6 literal
@@ -580,8 +554,8 @@ mod tests {
     // `guard_egress`, letting it fall through as if it weren't a literal IP at
     // all. Found via the `strip_brackets` fix, not by inspection — worth its
     // own guard against a future refactor reintroducing a bare `.parse()`.
-    #[tokio::test]
-    async fn guard_url_rejects_bracketed_ipv6_literals() {
+    #[test]
+    fn guard_url_rejects_bracketed_ipv6_literals() {
         for s in [
             "http://[::1]/",
             "http://[::1]:8080/x",
@@ -589,21 +563,28 @@ mod tests {
             "http://[fe80::1]/",
         ] {
             let u = Url::parse(s).unwrap();
-            assert!(guard_url(&u, true, false).await.is_err(), "{s} on direct");
-            assert!(guard_url(&u, false, false).await.is_err(), "{s} on proxied");
+            assert!(guard_url(&u, false).is_err(), "{s}");
         }
         // relaxed: ordinary private IPv6 passes, same as its IPv4 counterpart
         let u = Url::parse("http://[fd00::1]/").unwrap();
-        assert!(guard_url(&u, true, true).await.is_ok());
+        assert!(guard_url(&u, true).is_ok());
     }
 
-    #[tokio::test]
-    async fn guard_url_rejects_non_http_schemes() {
+    #[test]
+    fn guard_url_rejects_non_http_schemes() {
         let u = Url::parse("file:///etc/passwd").unwrap();
-        assert!(matches!(
-            guard_url(&u, true, true).await,
-            Err(CobwebError::Blocked(_))
-        ));
+        assert!(matches!(guard_url(&u, true), Err(CobwebError::Blocked(_))));
+    }
+
+    #[test]
+    fn guard_url_never_resolves_hostnames() {
+        // `.invalid` can never resolve: a lookup here would either fail or
+        // hang on the resolver — the check must stay DNS-free.
+        let u = Url::parse("https://cdn.example.invalid/seg.ts").unwrap();
+        assert!(guard_url(&u, false).is_ok());
+        let lo = Url::parse("http://localhost:8080/").unwrap();
+        assert!(guard_url(&lo, false).is_err());
+        assert!(guard_url(&lo, true).is_ok());
     }
 
     fn raw_egress(url: &str) -> crate::egress::Egress {

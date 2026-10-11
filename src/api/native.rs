@@ -206,12 +206,7 @@ pub async fn fetch(
         .resolve(req.egress.as_deref(), req.proxy_url.as_deref())?;
     crate::ssrf::guard_egress(&egress, st.config.server.private_proxy_hosts_ok()).await?;
     st.egress.ensure_available(&egress).await?;
-    crate::ssrf::guard_url(
-        &url,
-        egress.is_direct(),
-        st.config.server.allow_private_targets,
-    )
-    .await?;
+    crate::ssrf::guard_url(&url, st.config.server.allow_private_targets)?;
 
     // No per-request total timeout: it would cut a healthy long download mid
     // stream. raw_client carries connect + read-inactivity guards, and the

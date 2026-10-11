@@ -1,8 +1,9 @@
 # Build/test wrappers that work from BOTH places:
 #
 #   * inside the devcontainer (or any shell with `cargo` on PATH) → runs cargo directly
-#   * on the bare host (Aurora/Kinoite has no cargo)              → runs inside
-#     rust:1-bookworm via podman, reusing named cache volumes
+#   * on the bare host (Aurora/Kinoite has no cargo)              → runs in a throwaway
+#     container of the devcontainer's own compose service (same image, same
+#     `target`/registry volumes, same paths as VS Code → no duplicate build caches)
 #
 #   make test | check | fmt | run | shell
 #
@@ -11,21 +12,15 @@
 
 HAVE_CARGO := $(shell command -v cargo >/dev/null 2>&1 && echo yes)
 
-IMAGE      ?= docker.io/library/rust:1-bookworm
-CARGO_VOL  ?= cobweb-cargo-registry
-TARGET_VOL ?= cobweb-target
-PODMAN      = podman run --rm -it -v "$(CURDIR)":/w:z -w /w \
-              -v $(CARGO_VOL):/usr/local/cargo/registry -v $(TARGET_VOL):/w/target \
-              -e CC=clang -e CXX=clang++ -e CARGO_TERM_COLOR=always
-# wreq's BoringSSL (btls) needs cmake+clang; chromium for the browser tests.
-PREP        = apt-get update -qq && apt-get install -y -qq cmake clang chromium fonts-liberation >/dev/null 2>&1; \
-              rustup component add clippy rustfmt >/dev/null 2>&1 || true;
+# Project name = what VS Code uses (<folder>_devcontainer), so the named
+# volumes are shared with the editor's devcontainer.
+DC = docker compose -p $(notdir $(CURDIR))_devcontainer -f .devcontainer/docker-compose.dev.yml
 
-# $(call cargo,<cargo command>[,<extra podman args>])
+# $(call cargo,<cargo command>[,<extra `compose run` args>])
 ifeq ($(HAVE_CARGO),yes)
 cargo = bash -c '$(1)'
 else
-cargo = $(PODMAN) $(2) $(IMAGE) bash -c '$(PREP) $(1)'
+cargo = $(DC) run --rm $(2) dev bash -c '$(1)'
 endif
 
 .PHONY: test check fmt run shell build-image
@@ -39,10 +34,10 @@ fmt:
 	$(call cargo,cargo fmt)
 
 run:
-	$(call cargo,cargo run -- --config config.dev.toml,-p 8191:8191)
+	$(call cargo,cargo run -- --config config.dev.toml,--service-ports)
 
 shell:
-	$(call cargo,exec bash,-p 8191:8191)
+	$(call cargo,exec bash,--service-ports)
 
 build-image:
-	podman build -t cobweb:latest .
+	docker build -t cobweb:latest .

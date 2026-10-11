@@ -474,12 +474,7 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
         }
     }
 
-    crate::ssrf::guard_url(
-        &params.url,
-        egress.is_direct(),
-        state.config.server.allow_private_targets,
-    )
-    .await?;
+    crate::ssrf::guard_url(&params.url, state.config.server.allow_private_targets)?;
 
     let jar_entry = state.jar.get_fresh(&domain, &egress).await;
     let globset = globset_for(&params.url_pattern)?;
@@ -739,12 +734,7 @@ pub async fn navigate_fastpath(
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
     crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
-    crate::ssrf::guard_url(
-        &url,
-        egress.is_direct(),
-        state.config.server.allow_private_targets,
-    )
-    .await?;
+    crate::ssrf::guard_url(&url, state.config.server.allow_private_targets)?;
     let jar = state.jar.get_fresh(&domain, &egress).await;
 
     let now = chrono::Utc::now().timestamp() as f64;
@@ -833,12 +823,7 @@ pub async fn browser_sniff(
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
     crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
-    crate::ssrf::guard_url(
-        &trigger,
-        egress.is_direct(),
-        state.config.server.allow_private_targets,
-    )
-    .await?;
+    crate::ssrf::guard_url(&trigger, state.config.server.allow_private_targets)?;
     let jar_entry = state.jar.get_fresh(&domain, &egress).await;
     let globset = globset_for(&url_pattern)?;
 
@@ -898,12 +883,7 @@ pub async fn browser_eval(
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
     crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
-    crate::ssrf::guard_url(
-        &url,
-        egress.is_direct(),
-        state.config.server.allow_private_targets,
-    )
-    .await?;
+    crate::ssrf::guard_url(&url, state.config.server.allow_private_targets)?;
     let jar_entry = state.jar.get_fresh(&domain, &egress).await;
 
     let opts = ContextOptions {

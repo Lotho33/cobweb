@@ -457,7 +457,7 @@ async fn fetch_source(
     // The fast client's resolver vets hostnames, but never sees an IP
     // literal (`http://169.254.169.254/…`) or a non-http scheme — run the
     // same entry-point guard every other outbound fetch uses.
-    crate::ssrf::guard_url(&url, true, allow_private).await?;
+    crate::ssrf::guard_url(&url, allow_private)?;
     let egress = Egress::direct();
     let resp = fast
         .fetch(FetchRequest {

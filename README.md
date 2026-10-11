@@ -55,8 +55,8 @@ or a private container network.
 
 ## Building / testing
 
-No host toolchain needed — everything runs in `rust:1-bookworm` via podman
-(see the `Makefile`):
+No host toolchain needed — on the host the `Makefile` runs cargo in the
+devcontainer's compose service (same image and cache volumes as VS Code):
 
 ```sh
 make test     # cargo test   (in-container)
