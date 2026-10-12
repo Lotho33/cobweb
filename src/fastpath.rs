@@ -9,7 +9,7 @@
 //! `impit` without touching the pipeline (DESIGN.md §14.1).
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -64,6 +64,11 @@ pub trait FastClient: Send + Sync {
             "raw fetch client not available for this fast engine",
         ))
     }
+    /// Drop the cached streaming client of `egress` so the next
+    /// [`raw_client`](Self::raw_client) dials fresh connections. Used when the
+    /// caller saw a request stall: retrying on the same pooled HTTP/2
+    /// connection would stall again.
+    fn reset_raw_client(&self, _egress: &Egress) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,7 +83,8 @@ pub struct WreqClient {
     /// which for a caller-supplied `proxy_url` is distinct per proxy — an
     /// unbounded map let a caller cycling through proxy URLs pile up whole
     /// clients (TLS context + connection pool each) forever.
-    cache: Mutex<BoundedMap<String, wreq::Client>>,
+    /// Each entry carries when it was built (see `reset_raw_client`).
+    cache: Mutex<BoundedMap<String, (wreq::Client, Instant)>>,
     /// Passed to the per-client [`crate::ssrf::GuardedResolver`].
     allow_private_targets: bool,
     /// `[server].allow_private_proxies`: a raw request `proxy_url`'s host may
@@ -93,6 +99,11 @@ pub struct WreqClient {
 /// Max cached `wreq::Client`s (named profiles × 2 kinds, plus recent raw
 /// proxies). An evicted client is simply rebuilt on next use.
 const CLIENT_CACHE_CAP: usize = 64;
+
+/// A client younger than this is not rebuilt by `reset_raw_client`: several
+/// requests stalled on the same connection ask for a reset at once, and the
+/// first rebuild already serves them all.
+const CLIENT_RESET_MIN_AGE: Duration = Duration::from_secs(3);
 
 /// How a cached `wreq::Client` should be tuned.
 #[derive(Clone, Copy)]
@@ -123,19 +134,8 @@ impl WreqClient {
     }
 
     fn client_for(&self, egress: &Egress, kind: ClientKind) -> Result<wreq::Client> {
-        let kind_tag = match kind {
-            ClientKind::FastPath => "fp",
-            ClientKind::Stream => "st",
-        };
-        // Keyed on the full proxy URL (credentials included — in-memory
-        // only), not `jar_key()`: two raw `proxy_url`s for the same host:port
-        // with different credentials used to share one cached client, so the
-        // second caller silently rode the first one's proxy login.
-        let key = format!(
-            "{}|{kind_tag}",
-            egress.proxy.as_ref().map_or("direct", |p| p.as_str())
-        );
-        if let Some(c) = self
+        let key = Self::cache_key(egress, kind);
+        if let Some((c, _)) = self
             .cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -209,8 +209,23 @@ impl WreqClient {
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, client.clone());
+            .insert(key, (client.clone(), Instant::now()));
         Ok(client)
+    }
+
+    /// Keyed on the full proxy URL (credentials included — in-memory only),
+    /// not `jar_key()`: two raw `proxy_url`s for the same host:port with
+    /// different credentials used to share one cached client, so the second
+    /// caller silently rode the first one's proxy login.
+    fn cache_key(egress: &Egress, kind: ClientKind) -> String {
+        let kind_tag = match kind {
+            ClientKind::FastPath => "fp",
+            ClientKind::Stream => "st",
+        };
+        format!(
+            "{}|{kind_tag}",
+            egress.proxy.as_ref().map_or("direct", |p| p.as_str())
+        )
     }
 }
 
@@ -225,6 +240,20 @@ impl FastClient for WreqClient {
     /// read-inactivity guards. Shares the per-egress pool with the fast path.
     fn raw_client(&self, egress: &Egress) -> Result<wreq::Client> {
         self.client_for(egress, ClientKind::Stream)
+    }
+
+    /// Requests already running keep their (cloned) client; only new ones get
+    /// the fresh pool, and the old connections close once those finish.
+    fn reset_raw_client(&self, egress: &Egress) {
+        let key = Self::cache_key(egress, ClientKind::Stream);
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache
+            .get(&key)
+            .is_some_and(|(_, built)| built.elapsed() >= CLIENT_RESET_MIN_AGE)
+        {
+            cache.remove(&key);
+            tracing::info!(egress = %egress.name, "fetch: stalled connection reported, streaming client rebuilt");
+        }
     }
 
     async fn fetch(&self, req: FetchRequest<'_>) -> Result<FetchResponse> {

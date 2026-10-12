@@ -169,6 +169,11 @@ pub struct FetchProxyRequest {
     /// didn't pass its own `Cookie`. Default true.
     #[serde(default = "default_true")]
     pub use_jar: bool,
+    /// The caller's previous attempt at this URL stalled: dial fresh
+    /// connections instead of reusing the pooled (HTTP/2) one, which may be
+    /// stuck — see `FastClient::reset_raw_client`.
+    #[serde(default)]
+    pub fresh_conn: bool,
 }
 
 fn default_true() -> bool {
@@ -212,6 +217,9 @@ pub async fn fetch(
     // stream. raw_client carries connect + read-inactivity guards, and the
     // caller's context cancellation still tears the request down. `timeout_ms`
     // is accepted for compat but not applied here.
+    if req.fresh_conn {
+        st.fast.reset_raw_client(&egress);
+    }
     let client = st.fast.raw_client(&egress)?;
     let mut rb = client.get(url.as_str());
 
