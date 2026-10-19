@@ -48,13 +48,18 @@ impl FlaresolverrClient {
             "url": url.as_str(),
             "maxTimeout": max_timeout.as_millis().min(180_000) as u64,
         });
+        let mut req = self.http.post(format!("{}/v1", self.endpoint));
         if let Some(p) = proxy {
             body["proxy"] = json!({ "url": p.as_str() });
+            // Byparr ignores the body `proxy` and reads these headers instead.
+            // The cf_clearance it earns is bound to the egress IP, so it must
+            // solve through the same exit the request will ride.
+            for (name, value) in byparr_proxy_headers(p) {
+                req = req.header(name, value);
+            }
         }
 
-        let resp = self
-            .http
-            .post(format!("{}/v1", self.endpoint))
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -98,6 +103,44 @@ impl FlaresolverrClient {
     }
 }
 
+/// `X-Proxy-Server` (`scheme://host:port`, no credentials) plus
+/// `X-Proxy-Username`/`X-Proxy-Password` when the proxy URL carries them.
+fn byparr_proxy_headers(p: &Url) -> Vec<(&'static str, String)> {
+    let mut server = format!("{}://{}", p.scheme(), p.host_str().unwrap_or_default());
+    if let Some(port) = p.port() {
+        server.push_str(&format!(":{port}"));
+    }
+    let mut out = vec![("X-Proxy-Server", server)];
+    if !p.username().is_empty() {
+        out.push(("X-Proxy-Username", percent_decode(p.username())));
+        out.push((
+            "X-Proxy-Password",
+            percent_decode(p.password().unwrap_or_default()),
+        ));
+    }
+    out
+}
+
+/// Url keeps userinfo percent-encoded; Byparr wants it raw.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn fs_cookie(v: &Value) -> Option<Cookie> {
     Some(Cookie {
         name: v.get("name")?.as_str()?.to_string(),
@@ -120,4 +163,28 @@ fn fs_cookie(v: &Value) -> Option<Cookie> {
             .and_then(Value::as_str)
             .map(str::to_string),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byparr_headers_from_proxy_url() {
+        let u = Url::parse("socks5://127.0.0.1:1080").unwrap();
+        assert_eq!(
+            byparr_proxy_headers(&u),
+            vec![("X-Proxy-Server", "socks5://127.0.0.1:1080".to_string())]
+        );
+        let u = Url::parse("http://us%40er:p%3Ass@proxy.example:3128").unwrap();
+        assert_eq!(
+            byparr_proxy_headers(&u),
+            vec![
+                ("X-Proxy-Server", "http://proxy.example:3128".to_string()),
+                ("X-Proxy-Username", "us@er".to_string()),
+                ("X-Proxy-Password", "p:ss".to_string()),
+            ]
+        );
+        assert_eq!(percent_decode("a%zz%4"), "a%zz%4");
+    }
 }

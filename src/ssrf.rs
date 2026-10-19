@@ -447,7 +447,7 @@ impl wreq::dns::Resolve for GuardedResolver {
         let allow_private = self.allow_private || trusted;
         Box::pin(async move {
             let host = name.as_str().to_owned();
-            let addrs: Vec<SocketAddr> = match &dns.backend {
+            let mut addrs: Vec<SocketAddr> = match &dns.backend {
                 DnsBackend::Custom(resolver) => match resolver.lookup_ip(name.as_str()).await {
                     Ok(lookup) => lookup.iter().map(|ip| SocketAddr::new(ip, 0)).collect(),
                     Err(e) => {
@@ -471,9 +471,18 @@ impl wreq::dns::Resolve for GuardedResolver {
                     );
                 }
             }
+            prefer_ipv4(&mut addrs);
             Ok(Box::new(addrs.into_iter()) as wreq::dns::Addrs)
         })
     }
+}
+
+/// IPv4 first, order otherwise kept. A `socks5://` egress gets only the
+/// first resolved address, and an IPv4-only VPN exit (a typical WireGuard
+/// config with no v6 Address) refuses a v6 one outright (ProxyConnect).
+/// Direct connections still see every address, just v4 preferred.
+fn prefer_ipv4(addrs: &mut [SocketAddr]) {
+    addrs.sort_by_key(|a| a.is_ipv6());
 }
 
 #[cfg(test)]
@@ -482,6 +491,27 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn prefer_ipv4_moves_v4_first_keeping_order() {
+        let sa = |s: &str| SocketAddr::new(ip(s), 0);
+        let mut v = vec![
+            sa("2606:4700::1"),
+            sa("104.16.1.1"),
+            sa("2606:4700::2"),
+            sa("104.16.2.2"),
+        ];
+        prefer_ipv4(&mut v);
+        assert_eq!(
+            v,
+            vec![
+                sa("104.16.1.1"),
+                sa("104.16.2.2"),
+                sa("2606:4700::1"),
+                sa("2606:4700::2"),
+            ]
+        );
     }
 
     #[test]
