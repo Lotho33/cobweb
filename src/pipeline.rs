@@ -205,8 +205,13 @@ impl Tier for FastPathTier {
             );
             return TierOutcome::Escalate(EscalateReason::Challenge);
         }
-        if resp.status == 403 || resp.status == 429 {
+        if resp.status == 403 {
             return TierOutcome::Escalate(EscalateReason::Challenge);
+        }
+        // Rate limited: let the browser try, but it's not a challenge (no
+        // jar failure, no FlareSolverr hammering a site that asked to back off).
+        if resp.status == 429 {
+            return TierOutcome::Escalate(EscalateReason::NeedsJs);
         }
 
         match sniff_stream_url(&resp.body, &resp.final_url) {
@@ -280,7 +285,10 @@ impl Tier for BrowserSniffTier {
         {
             Ok(hit) => {
                 let state = cx.storage_state().await.unwrap_or_default();
-                let kind = StreamKind::from_url(&hit.url).unwrap_or(StreamKind::Hls);
+                let kind = hit
+                    .kind
+                    .or_else(|| StreamKind::from_url(&hit.url))
+                    .unwrap_or(StreamKind::Hls);
                 let headers = browser_replay_headers(&hit, &state);
                 TierOutcome::Resolved(StreamResult {
                     stream_url: hit.url.to_string(),
@@ -421,7 +429,17 @@ pub async fn resolve(state: &AppState, params: ResolveParams) -> Result<ResolveO
     // Computed up front so errors are attributed to their domain too (they
     // all used to land on a single `"unknown"` label).
     let domain = registrable_domain(&params.url).unwrap_or_else(|_| "unknown".into());
-    let r = resolve_inner(state, params).await;
+    // Each tier gets the caller's timeout; this caps the whole chain (fast
+    // path, browser, FlareSolverr + browser retry, plus CDP setup/teardown)
+    // so a caller can rely on an upper bound.
+    let budget = params.timeout * 2 + Duration::from_secs(15);
+    let r = match tokio::time::timeout(budget, resolve_inner(state, params)).await {
+        Ok(r) => r,
+        Err(_) => Err(CobwebError::Browser(format!(
+            "resolve exceeded its {}s budget",
+            budget.as_secs()
+        ))),
+    };
     match &r {
         Ok(o) => state.metrics.resolve_ok(&o.domain, o.via_tier),
         Err(CobwebError::NeedsManualSolve { domain }) => state.metrics.resolve_needs_manual(domain),
@@ -441,9 +459,11 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
     crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
 
-    // yt-dlp path: for configured hosts, shell out instead of running the tiers.
-    // Runs before the SSRF guard — `[ytdlp].hosts` is an explicit operator
-    // allowlist and yt-dlp does its own fetching.
+    crate::ssrf::guard_url(&params.url, state.config.server.allow_private_targets)?;
+
+    // yt-dlp path: for configured hosts, shell out instead of running the tiers
+    // (`[ytdlp].hosts` is an explicit operator allowlist; yt-dlp fetches on
+    // its own).
     #[cfg(feature = "ytdlp")]
     if let Some(yt) = &state.ytdlp {
         if yt.handles(&params.url) {
@@ -473,8 +493,6 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
             });
         }
     }
-
-    crate::ssrf::guard_url(&params.url, state.config.server.allow_private_targets)?;
 
     let jar_entry = state.jar.get_fresh(&domain, &egress).await;
     let globset = globset_for(&params.url_pattern)?;
@@ -582,6 +600,26 @@ async fn try_flaresolverr(
 ) -> Option<TierOutcome> {
     let fs = state.flaresolverr.as_ref()?;
     let browser_tier = state.browser_tier.as_ref()?;
+
+    // The delegate's browser has no SSRF guard of its own. On a direct egress
+    // its connect would go to whatever the name resolves to now, so vet it
+    // here first (best effort: it narrows, not closes, a rebinding window —
+    // keep FlareSolverr/Byparr off the host network, see README).
+    if egress.proxy.is_none() {
+        let host = params.url.host_str().unwrap_or_default();
+        let port = params.url.port_or_known_default().unwrap_or(443);
+        if let Err(e) = crate::ssrf::vetted_socket_addrs(
+            host,
+            port,
+            state.config.server.allow_private_targets,
+            Some(&state.settings),
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "tier 3b: not delegating to flaresolverr");
+            return None;
+        }
+    }
 
     let sol = match fs
         .solve(&params.url, egress.proxy.as_ref(), params.timeout)
@@ -911,7 +949,11 @@ pub async fn browser_eval(
             .clone()
             .unwrap_or_else(|| JarEntry::new(domain.clone(), egress.jar_key(), ttl));
         entry.storage_state.merge_from(state_after.cookies);
-        let _ = state.jar.note_success(entry).await;
+        let _ = if out.is_ok() {
+            state.jar.note_success(entry).await
+        } else {
+            state.jar.merge_cookies(entry).await
+        };
     }
     cx.close().await;
 

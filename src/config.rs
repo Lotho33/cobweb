@@ -41,11 +41,10 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Address to bind. Defaults to loopback (`127.0.0.1`): the API is
-    /// unauthenticated and exposes an SSRF-capable fetcher and a browser-eval
-    /// endpoint, so it must not face an untrusted network. Set `"0.0.0.0"`
-    /// (or `"::"`) only when a trusted reverse proxy or a container network is
-    /// in front.
+    /// Address to bind. Defaults to loopback (`127.0.0.1`): the API exposes
+    /// an SSRF-capable fetcher and a browser-eval endpoint, so it must not
+    /// face an untrusted network. Set `"0.0.0.0"` (or `"::"`) only with
+    /// `api_key` set, behind a trusted reverse proxy or on a container network.
     #[serde(default = "default_bind")]
     pub bind: String,
     #[serde(default = "default_port")]
@@ -70,9 +69,9 @@ pub struct ServerConfig {
     #[serde(default)]
     pub allow_private_targets: bool,
     /// Shared secret required on every request (`Authorization: Bearer <key>`
-    /// or `X-Api-Key: <key>`) except `GET /health`. Unset => the API is
-    /// unauthenticated; `main.rs` warns loudly at startup if that's combined
-    /// with a non-loopback bind.
+    /// or `X-Api-Key: <key>`) except `GET /health`; `COBWEB_API_KEY`
+    /// overrides it. Unset => the API is unauthenticated; `main.rs` warns
+    /// loudly at startup if that's combined with a non-loopback bind.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Extra `Host` names accepted while `api_key` is unset (see
@@ -328,7 +327,16 @@ impl Config {
         let text = tokio::fs::read_to_string(path)
             .await
             .map_err(|e| CobwebError::Config(format!("cannot read {}: {e}", path.display())))?;
-        Self::parse(&text)
+        let mut cfg = Self::parse(&text)?;
+        // The key can live in the environment (a compose `.env`) instead of a
+        // config file that is shared or versioned.
+        if let Some(k) = std::env::var("COBWEB_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+        {
+            cfg.server.api_key = Some(k);
+        }
+        Ok(cfg)
     }
 
     /// A minimal usable default (used by tests and `--print-config`).
@@ -434,7 +442,7 @@ mod tests {
         assert_eq!(cfg.server.port, 8191);
         assert_eq!(cfg.jar.path, PathBuf::from("/data/jar"));
         assert!(cfg.egress.contains_key("direct"));
-        assert_eq!(cfg.egress["mullvad"].proxy, "socks5://mullvad:1080");
+        assert_eq!(cfg.egress["mullvad"].proxy, "socks5h://mullvad:1080");
         assert!(cfg.flaresolverr.endpoint.is_none());
         assert!(!cfg.ytdlp.enabled);
         assert_eq!(

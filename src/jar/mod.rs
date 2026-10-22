@@ -278,7 +278,18 @@ impl Jar {
     /// persisted. Re-reading the freshest on-disk entry under the write lock
     /// and merging the caller's cookies on top of *that* (instead of the
     /// caller's own, possibly stale, snapshot) closes that lost-update window.
-    pub async fn note_success(&self, mut entry: JarEntry) -> Result<()> {
+    pub async fn note_success(&self, entry: JarEntry) -> Result<()> {
+        self.save_merged(entry, true).await
+    }
+
+    /// Persist the cookies `entry` picked up without vouching for them: the
+    /// failure streak and `last_ok` stay as they are. For a call that ended
+    /// in an error or still on a challenge page.
+    pub async fn merge_cookies(&self, entry: JarEntry) -> Result<()> {
+        self.save_merged(entry, false).await
+    }
+
+    async fn save_merged(&self, mut entry: JarEntry, success: bool) -> Result<()> {
         let _g = self.write_lock.lock().await;
         let incoming_cookies = std::mem::take(&mut entry.storage_state.cookies);
         if let Some(current) = self.load_by_key(&entry.domain, &entry.egress).await {
@@ -289,10 +300,16 @@ impl Jar {
             if entry.accept_language.is_empty() {
                 entry.accept_language = current.accept_language;
             }
+            if !success {
+                entry.fail_streak = current.fail_streak;
+                entry.last_ok = current.last_ok;
+            }
         }
         entry.storage_state.merge_from(incoming_cookies);
-        entry.fail_streak = 0;
-        entry.last_ok = Some(Utc::now());
+        if success {
+            entry.fail_streak = 0;
+            entry.last_ok = Some(Utc::now());
+        }
         if entry.schema_version == 0 {
             entry.schema_version = SCHEMA_VERSION;
         }

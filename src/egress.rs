@@ -91,6 +91,9 @@ pub struct EgressRegistry {
     /// name -> last health check. `Mutex` because checks are cheap and rare;
     /// no need for an async lock.
     health: Mutex<BoundedMap<String, HealthEntry>>,
+    /// `[server].private_proxy_hosts_ok()`: the policy a raw `proxy_url`'s
+    /// host is vetted against before the health check connects to it.
+    private_proxies: bool,
 }
 
 impl EgressRegistry {
@@ -119,6 +122,7 @@ impl EgressRegistry {
         Ok(Self {
             profiles,
             health: Mutex::new(BoundedMap::new(HEALTH_CAP)),
+            private_proxies: cfg.server.private_proxy_hosts_ok(),
         })
     }
 
@@ -180,7 +184,8 @@ impl EgressRegistry {
             }
         }
 
-        let ok = tcp_reachable(proxy).await;
+        let vet = e.name.starts_with("raw:").then_some(self.private_proxies);
+        let ok = tcp_reachable(proxy, vet).await;
         self.health
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -209,19 +214,28 @@ impl EgressRegistry {
     }
 }
 
-/// TCP-connect to a proxy URL's host:port with a short timeout.
-async fn tcp_reachable(proxy: &Url) -> bool {
+/// TCP-connect to a proxy URL's host:port with a short timeout. With `vet`
+/// (a caller-supplied raw proxy) the name is resolved once and the connect
+/// goes to the vetted addresses, so a rebinding record can't turn this probe
+/// into a port scan of internal hosts.
+async fn tcp_reachable(proxy: &Url, vet: Option<bool>) -> bool {
     let Some(host) = proxy.host_str() else {
         return false;
     };
     let port = proxy.port_or_known_default().unwrap_or(1080);
-    let addr = format!("{host}:{port}");
+    let probe = async {
+        match vet {
+            Some(allow_private) => {
+                let addrs = crate::ssrf::vetted_socket_addrs(host, port, allow_private, None)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                tokio::net::TcpStream::connect(&addrs[..]).await
+            }
+            None => tokio::net::TcpStream::connect(format!("{host}:{port}")).await,
+        }
+    };
     matches!(
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::net::TcpStream::connect(&addr)
-        )
-        .await,
+        tokio::time::timeout(Duration::from_secs(3), probe).await,
         Ok(Ok(_))
     )
 }

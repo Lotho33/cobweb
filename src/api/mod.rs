@@ -167,6 +167,20 @@ fn host_allowed(host: &str, extra: &[String]) -> bool {
 }
 
 async fn require_api_key(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    // cobweb's callers are servers. A browser always sends `Origin` on
+    // cross-origin and on non-GET requests, so refusing it stops a web page
+    // (an ad in a browser on the same host, a page rendered by FlareSolverr)
+    // from driving the API — with or without a key.
+    if req.headers().contains_key(header::ORIGIN) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "error": "browser requests are not accepted",
+                "kind": "forbidden",
+            })),
+        )
+            .into_response();
+    }
     // No key configured: unauthenticated by operator choice (main.rs warns
     // loudly at startup if this is paired with a non-loopback bind).
     if st.config.server.effective_api_key().is_none() || request_has_valid_key(&st, req.headers()) {

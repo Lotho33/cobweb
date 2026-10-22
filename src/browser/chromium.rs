@@ -6,6 +6,7 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,7 +33,34 @@ pub struct Chromium {
 impl Chromium {
     /// `max_contexts` sizes `--renderer-process-limit`: a sniff context is one
     /// page plus (often) one out-of-process embed subframe, so two renderers.
+    /// Launch with Chromium's sandbox unless `[browser].no_sandbox` (or root)
+    /// says otherwise. When the host can't provide one (no unprivileged user
+    /// namespaces, e.g. Docker's default seccomp profile) the launch is
+    /// retried once without it, loudly: a browser tier without a sandbox
+    /// beats no browser tier, but the operator has to know.
     pub async fn launch(cfg: &BrowserConfig, max_contexts: usize) -> BrowserResult<Self> {
+        static NO_SANDBOX_FALLBACK: AtomicBool = AtomicBool::new(false);
+        let no_sandbox =
+            cfg.no_sandbox || running_as_root() || NO_SANDBOX_FALLBACK.load(Ordering::Relaxed);
+        match Self::launch_with(cfg, max_contexts, no_sandbox).await {
+            Err(BrowserError::Unavailable(e)) if !no_sandbox && e.contains("No usable sandbox") => {
+                tracing::warn!(
+                    "Chromium has no usable sandbox on this host; running it with --no-sandbox. \
+                     Allow unprivileged user namespaces for the container (for Docker: \
+                     `security_opt: [seccomp=unconfined]` on the cobweb service) to restore it."
+                );
+                NO_SANDBOX_FALLBACK.store(true, Ordering::Relaxed);
+                Self::launch_with(cfg, max_contexts, true).await
+            }
+            r => r,
+        }
+    }
+
+    async fn launch_with(
+        cfg: &BrowserConfig,
+        max_contexts: usize,
+        no_sandbox: bool,
+    ) -> BrowserResult<Self> {
         let bin = resolve_binary(&cfg.chromium_path)?;
         let renderer_limit = max_contexts.saturating_mul(2).clamp(2, 8);
         let profile = tempdir::TempProfile::new()
@@ -44,10 +72,6 @@ impl Chromium {
         let (evt_rd, evt_wr) =
             cloexec_pipe().map_err(|e| BrowserError::Unavailable(format!("cdp pipe: {e}")))?;
 
-        let no_sandbox = cfg.no_sandbox || running_as_root();
-        if no_sandbox {
-            tracing::debug!("launching Chromium with --no-sandbox");
-        }
 
         // Pin a real desktop-Chrome UA + Accept-Language at the network layer so
         // every frame/worker request is consistent (CDP overrides race with
@@ -127,14 +151,19 @@ impl Chromium {
 
         // Drain stderr into a bounded buffer so a launch failure can say why.
         let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        if let Some(err) = child.stderr.take() {
-            tokio::spawn(crate::util::drain_bounded(err, stderr_tail.clone(), 8192));
-        }
+        let drain = child
+            .stderr
+            .take()
+            .map(|err| tokio::spawn(crate::util::drain_bounded(err, stderr_tail.clone(), 8192)));
 
         let client = match connect_pipe(cmd_wr, evt_rd).await {
             Ok(c) => c,
             Err(e) => {
                 let _ = child.start_kill();
+                // Let the drain catch the exit message (e.g. "No usable sandbox").
+                if let Some(d) = drain {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), d).await;
+                }
                 let tail = stderr_tail
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -160,7 +189,9 @@ impl Chromium {
     /// failed until the idle reaper happened to fire, which it never does
     /// under steady traffic.
     pub fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None)) && !self.client.is_closed()
+        matches!(self.child.try_wait(), Ok(None))
+            && !self.client.is_closed()
+            && !self.client.is_wedged()
     }
 
     pub async fn kill(mut self) {
@@ -182,39 +213,59 @@ impl Chromium {
     }
 }
 
-/// `<bin> --version` -> a desktop-Chrome UA string with the real major version.
-/// Memoised: the version can't change under a running cobweb, but Chromium is
-/// relaunched on every cold start after an idle shutdown and the probe is a
-/// full process spawn. Falls back to a recent-ish major if the probe fails.
+/// `<bin> --version` -> a desktop-Chrome UA string with the real major version
+/// and the machine's architecture (an x86_64 UA from an ARM box disagrees with
+/// `navigator.platform`). Memoised once the probe succeeds: the version can't
+/// change under a running cobweb, but Chromium is relaunched on every cold
+/// start after an idle shutdown and the probe is a full process spawn. A
+/// failed probe falls back to a recent major and is retried next launch.
 async fn desktop_ua(bin: &std::path::Path) -> String {
     static CACHE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
-    CACHE
-        .get_or_init(|| async { probe_desktop_ua(bin).await })
-        .await
-        .clone()
+    if let Some(ua) = CACHE.get() {
+        return ua.clone();
+    }
+    let major = match probe_major(bin).await {
+        Some(m) => {
+            let ua = ua_for(&m);
+            let _ = CACHE.set(ua.clone());
+            return ua;
+        }
+        None => "153".to_string(),
+    };
+    ua_for(&major)
 }
 
-async fn probe_desktop_ua(bin: &std::path::Path) -> String {
-    let major = Command::new(bin)
+fn ua_for(major: &str) -> String {
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "aarch64",
+        "arm" => "armv7l",
+        _ => "x86_64",
+    };
+    format!(
+        "Mozilla/5.0 (X11; Linux {arch}) AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/{major}.0.0.0 Safari/537.36"
+    )
+}
+
+/// The major version from `<bin> --version`, bounded: this runs while the
+/// launch lock is held, so a hung binary would stall every browser request.
+async fn probe_major(bin: &std::path::Path) -> Option<String> {
+    let out = Command::new(bin)
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .output()
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(5), out)
         .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            // "Chromium 151.0.7278.5" / "Google Chrome 151.0.7278.5"
-            s.split_whitespace()
-                .find_map(|t| t.split('.').next().filter(|n| n.parse::<u32>().is_ok()))
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "151".to_string());
-
-    format!(
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
-         Chrome/{major}.0.0.0 Safari/537.36"
-    )
+        .ok()?
+        .ok()?;
+    // "Chromium 151.0.7278.5" / "Google Chrome 151.0.7278.5"
+    String::from_utf8(out.stdout)
+        .ok()?
+        .split_whitespace()
+        .find_map(|t| t.split('.').next().filter(|n| n.parse::<u32>().is_ok()))
+        .map(str::to_string)
 }
 
 /// Wrap our ends of the pipe pair as a [`CdpClient`] and wait until the

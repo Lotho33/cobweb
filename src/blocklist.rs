@@ -36,6 +36,9 @@ use crate::error::{CobwebError, Result};
 use crate::fastpath::{FastClient, FetchRequest};
 use crate::util::{persist_json, random_token};
 
+/// Cap on `[blocklist]` sources added through the API.
+const MAX_SOURCES: usize = 32;
+
 /// Parse one block-list body into a set of bare, lowercased domains.
 ///
 /// Recognises hosts format (`0.0.0.0 domain` / `127.0.0.1 domain`, including
@@ -273,6 +276,11 @@ impl Blocklist {
     ) -> Result<BlocklistSourceView> {
         Url::parse(&url)
             .map_err(|e| CobwebError::BadRequest(format!("blocklist source url: {e}")))?;
+        if self.state.lock().await.sources.len() >= MAX_SOURCES {
+            return Err(CobwebError::Conflict(format!(
+                "at most {MAX_SOURCES} blocklist sources"
+            )));
+        }
         let (domains, last_error) = match fetch_source(fast, &url, self.allow_private_targets).await
         {
             Ok(body) => (parse_list(&body), None),

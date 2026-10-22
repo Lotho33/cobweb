@@ -83,6 +83,9 @@ pub struct SniffHit {
     /// fetch the stream (auth, referer, cookie, UA).
     pub request_headers: Vec<(String, String)>,
     pub final_url: Url,
+    /// Set when the match came from the response MIME type or body (a
+    /// manifest URL without an extension); `None` means "infer from `url`".
+    pub kind: Option<crate::fastpath::StreamKind>,
 }
 
 #[async_trait]

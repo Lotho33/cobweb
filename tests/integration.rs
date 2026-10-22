@@ -443,12 +443,7 @@ async fn fetch_proxies_body_and_status_and_forwards_allowlisted_headers() {
         Some("public, max-age=60")
     );
     assert!(headers.contains_key("x-cobweb-final-url"));
-    assert_eq!(
-        headers
-            .get("access-control-allow-origin")
-            .map(String::as_str),
-        Some("*")
-    );
+    assert!(!headers.contains_key("access-control-allow-origin"));
     assert_eq!(&body, b"\x47\x40\x00\x10TSDATA");
 }
 
@@ -648,6 +643,29 @@ async fn foreign_host_header_is_refused_without_an_api_key() {
         .await
         .unwrap();
     assert_eq!(ok.status().as_u16(), 200);
+}
+
+// A request from a browser (it always carries `Origin` on a cross-origin or
+// non-GET request) is refused before auth; /health stays reachable.
+#[tokio::test]
+async fn browser_requests_with_an_origin_are_refused() {
+    let app = TestApp::spawn().await;
+    let jar = app
+        .http
+        .get(format!("{}/v1/jar", app.base))
+        .header("origin", "https://evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(jar.status().as_u16(), 403);
+    let health = app
+        .http
+        .get(format!("{}/health", app.base))
+        .header("origin", "https://evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status().as_u16(), 200);
 }
 
 // Regression: `wreq` connects to the *proxy* through the client's DNS

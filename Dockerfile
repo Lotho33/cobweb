@@ -12,7 +12,7 @@
 # entirely, not just defaulted off; see Cargo.toml.
 
 # ---- build ----
-FROM rust:1-bookworm AS build
+FROM rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS build
 WORKDIR /src
 # wreq's TLS backend (btls / BoringSSL) compiles from source.
 RUN apt-get update && apt-get install -y --no-install-recommends cmake clang \
@@ -31,6 +31,8 @@ RUN touch src/main.rs src/lib.rs \
  && strip target/release/cobweb
 
 # ---- runtime ----
+# Not pinned on purpose: the weekly rebuild (release.yml) must pick up
+# Debian's Chromium and base security updates.
 FROM debian:bookworm-slim
 ARG WITH_YTDLP=0
 RUN apt-get update && apt-get install -y --no-install-recommends \

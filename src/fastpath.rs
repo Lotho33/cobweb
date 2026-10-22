@@ -467,14 +467,14 @@ pub fn looks_like_cloudflare_challenge(
     let cf_server = server_header
         .map(|s| s.to_ascii_lowercase().contains("cloudflare"))
         .unwrap_or(false);
+    // Only markers of the interstitial itself. A Turnstile widget, or the
+    // `/cdn-cgi/challenge-platform/scripts/…` bot-management script that
+    // Cloudflare injects into ordinary pages, is no reason to give up a sniff.
     let markers = [
-        "just a moment",
+        "<title>just a moment",
         "cf-browser-verification",
         "cf_chl_opt",
         "_cf_chl_",
-        "challenge-platform",
-        "turnstile",
-        "/cdn-cgi/challenge-platform/",
     ];
     // The interstitial markers are always in the document head (title + first
     // scripts); a real challenge page is a few KB. Cap the scan+lowercase alloc
@@ -602,6 +602,13 @@ mod tests {
             200,
             "<html>normal page</html>",
             Some("nginx")
+        ));
+        // A page that merely embeds Turnstile / CF's bot script is not a wall.
+        assert!(!looks_like_cloudflare_challenge(
+            200,
+            "<script src=\"/cdn-cgi/challenge-platform/scripts/jsd/main.js\"></script>\
+             <div class=\"cf-turnstile\"></div><p>Just a moment, loading…</p>",
+            Some("cloudflare"),
         ));
     }
 

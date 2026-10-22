@@ -97,6 +97,10 @@ fn ipv6_hard_reason(ip: Ipv6Addr) -> Option<&'static str> {
     if s[0] == 0x2001 && s[1] == 0x0db8 {
         return Some("documentation (2001:db8::/32)");
     }
+    // 100::/64 discard-only.
+    if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 {
+        return Some("discard-only (100::/64)");
+    }
     None
 }
 
@@ -112,6 +116,10 @@ fn ipv6_private_reason(ip: Ipv6Addr) -> Option<&'static str> {
     // fe80::/10 link-local.
     if (s[0] & 0xffc0) == 0xfe80 {
         return Some("link-local (fe80::/10)");
+    }
+    // fec0::/10 site-local (deprecated, still routed on some LANs).
+    if (s[0] & 0xffc0) == 0xfec0 {
+        return Some("site-local (fec0::/10)");
     }
     None
 }
@@ -135,33 +143,40 @@ fn classify(ip: IpAddr) -> Option<(&'static str, bool)> {
     }
 }
 
-/// The v4 address embedded in `::ffff:a.b.c.d`, `::a.b.c.d`, or the NAT64
-/// well-known prefix `64:ff9b::/96`. `None` for a genuine v6 address.
+/// The v4 address embedded in `::a.b.c.d`, `::ffff:0:a.b.c.d` (RFC 2765),
+/// the NAT64 prefixes `64:ff9b::/96` (RFC 6052) and `64:ff9b:1::/48`
+/// (RFC 8215, local use: the v4 sits in the low 32 bits), or 6to4
+/// `2002:a.b.c.d::/48`. `None` for a genuine v6 address. (`::ffff:a.b.c.d`
+/// is handled by `to_ipv4_mapped`.)
 fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let s = ip.segments();
-    // 64:ff9b::/96 (RFC 6052).
-    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
-        return Some(Ipv4Addr::new(
+    let low = || {
+        Ipv4Addr::new(
             (s[6] >> 8) as u8,
             (s[6] & 0xff) as u8,
             (s[7] >> 8) as u8,
             (s[7] & 0xff) as u8,
-        ));
+        )
+    };
+    let zero = |r: std::ops::Range<usize>| s[r].iter().all(|&x| x == 0);
+    if s[0] == 0x0064 && s[1] == 0xff9b && (zero(2..6) || s[2] == 0x0001) {
+        return Some(low());
+    }
+    // ::ffff:0:a.b.c.d (IPv4-translated).
+    if zero(0..4) && s[4] == 0xffff && s[5] == 0 {
+        return Some(low());
     }
     // ::a.b.c.d (deprecated IPv4-compatible) — top 96 bits zero, not ::/::1.
-    if s[0] == 0
-        && s[1] == 0
-        && s[2] == 0
-        && s[3] == 0
-        && s[4] == 0
-        && s[5] == 0
-        && (s[6] != 0 || s[7] > 1)
-    {
+    if zero(0..6) && (s[6] != 0 || s[7] > 1) {
+        return Some(low());
+    }
+    // 2002:a.b.c.d::/48 (6to4).
+    if s[0] == 0x2002 {
         return Some(Ipv4Addr::new(
-            (s[6] >> 8) as u8,
-            (s[6] & 0xff) as u8,
-            (s[7] >> 8) as u8,
-            (s[7] & 0xff) as u8,
+            (s[1] >> 8) as u8,
+            (s[1] & 0xff) as u8,
+            (s[2] >> 8) as u8,
+            (s[2] & 0xff) as u8,
         ));
     }
     None
@@ -257,34 +272,13 @@ pub async fn guard_egress(egress: &crate::egress::Egress, allow_private: bool) -
         return Err(CobwebError::BadRequest("proxy_url has no host".into()));
     };
 
-    let lower = host.to_ascii_lowercase();
-    if !allow_private && (lower == "localhost" || lower.ends_with(".localhost")) {
-        return Err(blocked(host, "localhost"));
-    }
-
-    if let Ok(ip) = strip_brackets(host).parse::<IpAddr>() {
-        if let Some(reason) = block_reason(ip, allow_private) {
-            return Err(blocked(host, reason));
-        }
-        return Ok(());
-    }
-
-    // A hostname proxy: resolve and vet every address — a resolution failure
-    // is not itself "blocked" (the connect that follows can't reach it either).
-    let port = proxy.port_or_known_default().unwrap_or(0);
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => {
-            for sa in addrs {
-                if let Some(reason) = block_reason(sa.ip(), allow_private) {
-                    return Err(blocked(host, reason));
-                }
-            }
-        }
-        Err(e) => {
-            tracing::debug!(%host, error = %e, "ssrf guard: could not resolve proxy_url host")
-        }
-    }
-    Ok(())
+    // Resolve and vet every address; a name that doesn't resolve is refused
+    // too (the health check would only resolve it again, see egress.rs).
+    let port = proxy.port_or_known_default().unwrap_or(1080);
+    vetted_socket_addrs(host, port, allow_private, None)
+        .await
+        .map(drop)
+        .map_err(|e| CobwebError::Blocked(format!("proxy_url refused: {e}")))
 }
 
 /// Resolve `host:port` and vet every address — the connect-time check the
@@ -360,7 +354,7 @@ pub fn redirect_block_reason(host: &str, allow_private: bool) -> Option<&'static
     if let Ok(ip) = bare.parse::<IpAddr>() {
         return block_reason(ip, allow_private);
     }
-    let lower = bare.to_ascii_lowercase();
+    let lower = bare.trim_end_matches('.').to_ascii_lowercase();
     if !allow_private && (lower == "localhost" || lower.ends_with(".localhost")) {
         return Some("loopback (localhost)");
     }
@@ -531,7 +525,12 @@ mod tests {
             "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
-            "64:ff9b::7f00:1", // NAT64-wrapped 127.0.0.1
+            "64:ff9b::7f00:1",     // NAT64-wrapped 127.0.0.1
+            "64:ff9b:1::c0a8:101", // local-use NAT64 192.168.1.1
+            "::ffff:0:a00:1",      // IPv4-translated 10.0.0.1
+            "2002:c0a8:101::1",    // 6to4 of 192.168.1.1
+            "fec0::1",             // site-local
+            "100::1",              // discard-only
         ] {
             assert!(
                 block_reason(ip(s), false).is_some(),
@@ -712,7 +711,8 @@ mod tests {
             "[::1]",
             "[fd00::1]",
             "localhost",
-            "a.localhost",
+            "localhost.",
+            "a.localhost.",
         ] {
             assert!(
                 redirect_block_reason(h, false).is_some(),

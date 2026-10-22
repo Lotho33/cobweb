@@ -123,15 +123,6 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
             json!({}),
         );
     };
-    if let Err(e) = engine.ensure_ready().await {
-        return envelope(
-            "error",
-            &format!("browser not ready: {e}"),
-            started,
-            json!({}),
-        );
-    }
-
     let proxy_url = req.proxy.as_ref().and_then(|p| p.url.clone());
     let egress = match st.egress.resolve(None, proxy_url.as_deref()) {
         Ok(e) => e,
@@ -147,6 +138,15 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
     }
     if let Err(e) = crate::ssrf::guard_url(&url, st.config.server.allow_private_targets) {
         return envelope("error", &e.to_string(), started, json!({}));
+    }
+    // Only now: an invalid request must not launch Chromium.
+    if let Err(e) = engine.ensure_ready().await {
+        return envelope(
+            "error",
+            &format!("browser not ready: {e}"),
+            started,
+            json!({}),
+        );
     }
 
     let domain =
@@ -198,7 +198,11 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
     if !user_agent.is_empty() {
         entry.user_agent = user_agent.clone();
     }
-    let _ = st.jar.note_success(entry).await;
+    let _ = if page.challenge {
+        st.jar.merge_cookies(entry).await
+    } else {
+        st.jar.note_success(entry).await
+    };
 
     let solution = json!({
         "url": page.final_url.to_string(),
@@ -225,6 +229,15 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
 async fn sessions_create(st: &AppState, req: V1Request, started: u128) -> Value {
     use crate::jar::JarEntry;
     let name = req.session.unwrap_or_else(|| format!("fs{}", now_ms()));
+    // FlareSolverr keeps an existing session (and its cookies) as it is.
+    if st.jar.load_key(&name, FS_KEY).await.is_some() {
+        return envelope(
+            "ok",
+            "Session already exists.",
+            started,
+            json!({ "session": name }),
+        );
+    }
     let ttl = st.settings.flaresolverr_session_ttl_secs();
     let entry = JarEntry::new(name.clone(), FS_KEY.to_string(), ttl);
     if let Err(e) = st.jar.save(&entry).await {

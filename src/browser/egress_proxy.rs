@@ -64,8 +64,15 @@ impl EgressProxy {
         let limit = Arc::new(Semaphore::new(MAX_CONNS));
         let task = tokio::spawn(async move {
             loop {
-                let Ok((sock, _)) = listener.accept().await else {
-                    continue;
+                let sock = match listener.accept().await {
+                    Ok((sock, _)) => sock,
+                    Err(e) => {
+                        // EMFILE & co. fail instantly: back off instead of
+                        // spinning a core until a descriptor frees up.
+                        tracing::warn!(error = %e, "egress proxy: accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
                 let Ok(permit) = limit.clone().acquire_owned().await else {
                     break;
@@ -149,9 +156,21 @@ async fn serve(
     Ok(())
 }
 
+/// Try the vetted addresses in order. A dead address (an IPv6 route that
+/// blackholes, say) gets a short slice of the overall budget, not all of it.
 async fn connect_any(addrs: &[SocketAddr]) -> Option<TcpStream> {
+    let per_addr = if addrs.len() > 1 {
+        Duration::from_secs(4)
+    } else {
+        CONNECT_TIMEOUT
+    };
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
     for a in addrs {
-        if let Ok(Ok(s)) = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(a)).await {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        if let Ok(Ok(s)) = tokio::time::timeout(per_addr.min(left), TcpStream::connect(a)).await {
             return Some(s);
         }
     }

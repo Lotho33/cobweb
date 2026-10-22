@@ -72,9 +72,9 @@ impl Ytdlp {
             .arg("-g")
             .arg("--no-warnings")
             .arg("--no-playlist");
-        if let Some(p) = proxy {
-            cmd.arg("--proxy").arg(p.as_str());
-        }
+        // An empty --proxy means direct: yt-dlp must not pick up an
+        // HTTP(S)_PROXY from cobweb's environment behind the egress's back.
+        cmd.arg("--proxy").arg(proxy.map_or("", Url::as_str));
         if let Some(f) = &cookie_file {
             cmd.arg("--cookies").arg(&f.0);
         }

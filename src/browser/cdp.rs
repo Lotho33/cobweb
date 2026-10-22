@@ -11,7 +11,7 @@
 //! exists to dodge.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,6 +26,9 @@ use super::engine::{BrowserError, BrowserResult};
 /// `maxResourceBufferSize`, base64-inflated) and a full `outerHTML`; this is
 /// only a backstop so a misbehaving peer can't grow the read buffer forever.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Browser-level timeouts in a row after which the browser counts as wedged.
+const STALL_LIMIT: u32 = 3;
 
 /// A CDP event (`Network.requestWillBeSent`, `Page.lifecycleEvent`, …).
 ///
@@ -59,6 +62,8 @@ pub struct CdpClient {
     control: broadcast::Sender<CdpEvent>,
     /// Set once the reader sees EOF/an error — Chromium exited or crashed.
     closed: Arc<AtomicBool>,
+    /// Consecutive browser-level calls that timed out (see [`Self::is_wedged`]).
+    stalls: AtomicU32,
     reader: tokio::task::JoinHandle<()>,
     writer: tokio::task::JoinHandle<()>,
 }
@@ -127,6 +132,7 @@ impl CdpClient {
             events: events_tx,
             control: control_tx,
             closed,
+            stalls: AtomicU32::new(0),
             reader,
             writer,
         })
@@ -135,6 +141,13 @@ impl CdpClient {
     /// `true` once the transport hit EOF — the browser is gone.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// `true` when the browser process is alive but has stopped answering:
+    /// [`STALL_LIMIT`] browser-level calls in a row timed out. Page-level
+    /// calls don't count — one hung renderer is not a hung browser.
+    pub fn is_wedged(&self) -> bool {
+        self.stalls.load(Ordering::Relaxed) >= STALL_LIMIT
     }
 
     /// New event stream. Subscribe **before** sending the command that triggers
@@ -204,7 +217,15 @@ impl CdpClient {
             )));
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        let res = tokio::time::timeout(timeout, rx).await;
+        if session_id.is_none() {
+            if res.is_err() {
+                self.stalls.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.stalls.store(0, Ordering::Relaxed);
+            }
+        }
+        match res {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => Err(BrowserError::Cdp(format!("{method}: {e}"))),
             Ok(Err(_)) => Err(BrowserError::Cdp(format!("{method}: response dropped"))),

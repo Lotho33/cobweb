@@ -60,18 +60,21 @@ path = "/data/jar"
 # Each request names one of these ("egress": "mullvad") or passes a raw
 # "proxy_url" (cobweb back-compat). A named egress that is configured but
 # unreachable FAILS the request — it never falls back to direct.
+# socks5h:// resolves names at the proxy (no DNS leak outside a VPN exit);
+# socks5:// resolves them locally. The browser tier always resolves at the
+# proxy and can't use a proxy that needs credentials.
 
 [egress.direct]
 proxy = ""
 
 [egress.mullvad]
-proxy = "socks5://mullvad:1080"
+proxy = "socks5h://mullvad:1080"
 
 [egress.proton]
-proxy = "socks5://proton:1080"
+proxy = "socks5h://proton:1080"
 
 [egress.warp]
-proxy = "socks5://warp:1080"
+proxy = "socks5h://warp:1080"
 
 # ─── Optional: delegate hard challenges to an external FlareSolverr ───────────
 # Unset `endpoint` to disable tier 3b. When set, a challenge cobweb's own browser

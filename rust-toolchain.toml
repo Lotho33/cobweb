@@ -1,5 +1,6 @@
 # Pin the toolchain so CI, contributors and `cargo fmt` all agree.
-# On a `stable` bump that reformats code, re-run `cargo fmt` in the same commit.
+# Bump by hand (with the Dockerfile's build image and the CI `browser` job);
+# re-run `cargo fmt` and clippy in the same commit.
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]

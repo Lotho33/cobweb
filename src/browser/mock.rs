@@ -181,6 +181,7 @@ impl BrowserContext for MockContext {
                     url: u,
                     request_headers: headers.clone(),
                     final_url: trigger.clone(),
+                    kind: None,
                 })
             }
             SniffScript::Challenge => Err(BrowserError::Challenge),

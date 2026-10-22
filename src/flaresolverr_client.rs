@@ -50,6 +50,7 @@ impl FlaresolverrClient {
         });
         let mut req = self.http.post(format!("{}/v1", self.endpoint));
         if let Some(p) = proxy {
+            let p = &delegate_proxy(p);
             body["proxy"] = json!({ "url": p.as_str() });
             // Byparr ignores the body `proxy` and reads these headers instead.
             // The cf_clearance it earns is bound to the egress IP, so it must
@@ -101,6 +102,19 @@ impl FlaresolverrClient {
             status: sol.get("status").and_then(Value::as_u64).unwrap_or(0) as u16,
         })
     }
+}
+
+/// The egress proxy as the delegate's browser understands it: Chromium (and
+/// Camoufox) know no `socks5h`/`socks4a` and resolve at a SOCKS5 proxy anyway.
+fn delegate_proxy(p: &Url) -> Url {
+    let scheme = match p.scheme() {
+        "socks5h" => "socks5",
+        "socks4a" => "socks4",
+        _ => return p.clone(),
+    };
+    let mut out = p.clone();
+    let _ = out.set_scheme(scheme);
+    out
 }
 
 /// `X-Proxy-Server` (`scheme://host:port`, no credentials) plus
@@ -168,6 +182,19 @@ fn fs_cookie(v: &Value) -> Option<Cookie> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegate_proxy_drops_the_remote_dns_suffix() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        assert_eq!(
+            delegate_proxy(&u("socks5h://u:p@warp:40000")).as_str(),
+            "socks5://u:p@warp:40000"
+        );
+        assert_eq!(
+            delegate_proxy(&u("http://proxy:3128")).as_str(),
+            "http://proxy:3128/"
+        );
+    }
 
     #[test]
     fn byparr_headers_from_proxy_url() {

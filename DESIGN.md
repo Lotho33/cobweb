@@ -360,17 +360,20 @@ session name instead of `(domain, egress)`.
 
 The API takes a caller-supplied URL and fetches it. `ssrf::guard_url` runs at
 every entry point (`/v1/resolve`, `/v1/navigate`, `/v1/fetch`, `/v1/sniff`,
-`/v1/eval`, inbound `/v1`, `/v1/session/start`) before anything connects:
+`/v1/eval`, inbound `/v1`) before anything connects:
 
 - **scheme** must be `http`/`https`;
-- a **literal** non-global IP or `localhost` in the URL is refused on any egress;
-- on the **direct** egress the host is resolved and refused if *any* A/AAAA is
-  non-global (rebinding lure). A proxied egress resolves at the proxy — the
-  operator owns that exit — so only the literal check applies there.
+- a **literal** non-global IP or `localhost` (trailing dot included) in the URL
+  is refused on any egress.
 
-On the fast path the same predicate is the `wreq` DNS resolver
-(`ssrf::GuardedResolver`), so it re-runs on every redirect hop and pins the
-connection to the vetted address (no TOCTOU re-resolve).
+Names are not resolved there: the check happens at connect time, by the code
+that then connects to the vetted address (no TOCTOU re-resolve). On the fast
+path that is the `wreq` DNS resolver (`ssrf::GuardedResolver`), which re-runs
+on every redirect hop; in the browser, a `direct` context rides cobweb's own
+connect-time proxy (`browser/egress_proxy.rs`, WebSockets included). A proxied
+egress resolves at the proxy — the operator owns that exit. A caller-supplied
+raw `proxy_url` is resolved and vetted once, and both the health check and
+Chromium connect to that vetted address.
 
 Two tiers of "bad": **hard-blocked** (`0.0.0.0/8`, `169.254.169.254`, multicast,
 broadcast, documentation, benchmarking, reserved) is always refused;
@@ -379,13 +382,14 @@ broadcast, documentation, benchmarking, reserved) is always refused;
 true` — the escape hatch for an operator who deliberately points cobweb at a LAN
 media server.
 
-The CDP browser context sets **no** `proxyBypassList`: when an egress proxy is
-configured, loopback/private targets ride it too instead of leaking out direct.
+The CDP browser context sets `proxyBypassList: "<-loopback>"`: loopback
+targets ride the egress proxy (and its checks) instead of Chromium's implicit
+bypass.
 
-**Residual (M-follow-up):** subresource / JS-initiated fetches *inside* Chromium
-(notably `/v1/eval`) are not individually re-checked against resolved IPs —
-full coverage needs `Fetch`-domain interception with an async allowlist. The
-caller-supplied navigation URL and top-level redirects are covered.
+**Residual:** the FlareSolverr delegate (tier 3b) runs in an external browser
+with no guard of its own. On a direct egress cobweb vets the target name before
+delegating, which narrows but doesn't close a rebinding window; run
+FlareSolverr/Byparr on an isolated network, not the host's.
 
 ---
 
@@ -642,7 +646,7 @@ Point `COBWEB_ADDR` at this service. It implements the same `/v1/*`, `/health`,
 `/vnc/`, session contract and honours the `proxy_url` field. `docker-compose.yml`:
 set the `cobweb` service `image:` to `cobweb:latest`, keep everything else (ports
 8191, the `data/cobweb` volume, `COBWEB_MAX_CONTEXTS`, …). The deprecated
-`HYPHA_CONFIG` / `HYPHA_NOVNC` env names are still read for one release.
+`HYPHA_CONFIG` env name is still read.
 
 `internal/managers/browser_client.go`, `internal/api/vpn_session.go`,
 `web/static/admin.js` VNC session UI — all keep working untouched.
@@ -794,5 +798,4 @@ ENTRYPOINT ["tini", "--", "cobweb"]
 
 Published as **cobweb**, renamed from the `hypha` codename used during design.
 The binary, crate, Docker image, `COBWEB_*` env vars and the `cobweb_*` metric
-prefix all share the name; `HYPHA_CONFIG` / `HYPHA_NOVNC` are honoured as
-deprecated aliases for one release.
+prefix all share the name; `HYPHA_CONFIG` is honoured as a deprecated alias.

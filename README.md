@@ -12,8 +12,8 @@ which calls it over plain HTTP. It can also be used on its own.
 > sources and no site-specific scrapers. Use it only against services you are
 > entitled to access.
 
-> Renamed from `hypha`. The old `HYPHA_CONFIG` / `HYPHA_NOVNC` env vars are
-> still honoured for one release; Prometheus metrics are now `cobweb_*`.
+> Renamed from `hypha`. The old `HYPHA_CONFIG` env var is still honoured;
+> Prometheus metrics are now `cobweb_*`.
 
 ## How it works
 
@@ -27,7 +27,9 @@ Requests go through tiers, cheapest first:
    requests. Used only when the fast path can't see the URL.
 3. **FlareSolverr delegate** *(optional)* — hand a hard page to an external,
    separately-run FlareSolverr instance and retry the sniff with the cookies
-   it returns. Point `[flaresolverr].endpoint` at it; unset by default.
+   it returns. Point `[flaresolverr].endpoint` at it; unset by default. Its
+   browser has no SSRF guard of its own: run it on an isolated container
+   network, not the host's.
 
 If every tier fails on a challenge, cobweb returns a structured
 `needs_manual_solve` error — it has no interactive solve capability of its
@@ -49,9 +51,11 @@ See **[DESIGN.md](DESIGN.md)** for the full rationale.
 ## Configuration
 
 Copy `config.example.toml`, set `COBWEB_CONFIG` to its path. Every knob is
-documented inline. Note that `[server].bind` defaults to `127.0.0.1`: the API is
-unauthenticated, so only bind a routable address behind a trusted reverse proxy
-or a private container network.
+documented inline. Set `[server].api_key` (or `COBWEB_API_KEY`): without it the
+API is unauthenticated. `[server].bind` defaults to `127.0.0.1`; only bind a
+routable address with a key, behind a trusted reverse proxy or on a private
+container network. Requests carrying an `Origin` header (i.e. from a browser)
+are always refused.
 
 ## Building / testing
 

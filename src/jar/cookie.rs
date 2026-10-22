@@ -30,6 +30,9 @@ pub struct Cookie {
     pub same_site: Option<String>,
 }
 
+/// Per-entry cookie cap (see [`StorageState::merge_from`]).
+pub const MAX_COOKIES: usize = 200;
+
 fn default_path() -> String {
     "/".to_string()
 }
@@ -161,7 +164,14 @@ impl StorageState {
     /// Merge `incoming` on top of `self`: cookies with the same `(name, domain,
     /// path)` are replaced, the rest appended. Used when a fast-path response
     /// carries `Set-Cookie`, or a browser context hands back an updated state.
+    /// Expired cookies (an expired `Set-Cookie` is a deletion) are dropped and
+    /// at most [`MAX_COOKIES`] are kept, oldest first out, so a noisy or
+    /// hostile upstream can't grow the jar file without bound.
     pub fn merge_from(&mut self, incoming: impl IntoIterator<Item = Cookie>) {
+        self.merge_at(incoming, chrono::Utc::now().timestamp() as f64);
+    }
+
+    fn merge_at(&mut self, incoming: impl IntoIterator<Item = Cookie>, now: f64) {
         for c in incoming {
             if let Some(slot) = self
                 .cookies
@@ -172,6 +182,10 @@ impl StorageState {
             } else {
                 self.cookies.push(c);
             }
+        }
+        self.cookies.retain(|c| c.is_live(now));
+        if let Some(excess) = self.cookies.len().checked_sub(MAX_COOKIES) {
+            self.cookies.drain(..excess);
         }
     }
 
@@ -209,6 +223,23 @@ pub(crate) fn domain_matches(cookie_domain: &str, host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merge_drops_expired_cookies_and_caps_the_entry() {
+        let mut st = StorageState::default();
+        let mut old = Cookie::new("gone", "1", "example.com");
+        old.expires = 50.0;
+        st.merge_at([old, Cookie::new("keep", "1", "example.com")], 100.0);
+        assert_eq!(st.cookies.len(), 1);
+        assert_eq!(st.cookies[0].name, "keep");
+
+        st.merge_at(
+            (0..MAX_COOKIES + 5).map(|i| Cookie::new(format!("c{i}"), "v", "example.com")),
+            100.0,
+        );
+        assert_eq!(st.cookies.len(), MAX_COOKIES);
+        assert!(!st.cookies.iter().any(|c| c.name == "keep"));
+    }
+
     use super::*;
 
     #[test]

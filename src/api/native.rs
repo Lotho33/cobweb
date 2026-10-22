@@ -150,8 +150,8 @@ pub async fn navigate(
 // fingerprint (wreq/BoringSSL) instead of a second impersonation stack on the
 // mycelium side. cobweb applies the egress + jar cookies and streams the body
 // straight back — it does NOT buffer or sniff (unlike /v1/navigate). All the
-// caching/dedup/retry logic stays in mycelium's proxy. Unauthenticated like
-// the rest of the API: keep it on a private network (see [server].bind).
+// caching/dedup/retry logic stays in mycelium's proxy. Behind
+// `[server].api_key` like the rest of the API (see [server].bind).
 
 #[derive(Debug, Deserialize)]
 pub struct FetchProxyRequest {
@@ -274,10 +274,6 @@ pub async fn fetch(
     if let Ok(hv) = HeaderValue::from_str(&final_url) {
         out.insert(HeaderName::from_static("x-cobweb-final-url"), hv);
     }
-    out.insert(
-        HeaderName::from_static("access-control-allow-origin"),
-        HeaderValue::from_static("*"),
-    );
 
     let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
     *response.status_mut() = status;

@@ -108,9 +108,9 @@ async fn run() -> ExitCode {
         {
             tracing::warn!(
                 egress = %name,
-                "proxy uses socks5:// / socks4://: target names are resolved LOCALLY, so DNS \
-                 queries bypass the proxy (a DNS leak for a VPN exit). Use socks5h:// to \
-                 resolve at the proxy."
+                "proxy uses socks5:// / socks4://: the fast path resolves target names \
+                 LOCALLY, so DNS queries bypass the proxy (a DNS leak for a VPN exit). Use \
+                 socks5h:// to resolve at the proxy (the browser tier always does)."
             );
         }
     }

@@ -21,11 +21,12 @@ use super::egress_proxy::EgressProxy;
 use super::engine::*;
 use crate::blocklist::Blocklist;
 use crate::config::BrowserConfig;
-use crate::fastpath::looks_like_cloudflare_challenge;
+use crate::fastpath::{looks_like_cloudflare_challenge, StreamKind};
 use crate::jar::{Cookie, StorageState};
 
+// `navigator.webdriver` is already false (`--disable-blink-features=
+// AutomationControlled`); redefining it would add a detectable own property.
 const STEALTH_JS: &str = r#"
-Object.defineProperty(navigator, 'webdriver', { get: () => false });
 window.chrome = window.chrome || { runtime: {} };
 "#;
 
@@ -187,7 +188,9 @@ impl CdpEngine {
         let mut g = self.launched.lock().await;
         if let Some(l) = g.as_mut() {
             if !l.chromium.is_alive() {
-                tracing::warn!("Chromium exited or lost its CDP connection; relaunching");
+                tracing::warn!(
+                    "Chromium exited, lost its CDP connection or stopped answering; relaunching"
+                );
                 if let Some(dead) = g.take() {
                     dead.chromium.kill().await;
                 }
@@ -307,7 +310,7 @@ impl BrowserEngine for CdpEngine {
             Some(p) if opts.egress.name.starts_with("raw:") => {
                 pinned_proxy_server(p, self.private_proxies, self.dns_settings.as_deref()).await?
             }
-            Some(p) => p.as_str().trim_end_matches('/').to_string(),
+            Some(p) => chromium_proxy_server(p)?,
             None => self
                 .egress_proxy
                 .get_or_try_init(|| {
@@ -329,6 +332,20 @@ impl BrowserEngine for CdpEngine {
             .get("browserContextId")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // Until `CdpContext` (whose `Drop` tears it down) exists, an error or
+        // a dropped future below would leave the context alive in Chromium.
+        let mut ctx_guard = DisposeOnDrop(Some((client.clone(), browser_context_id.clone())));
+        if let Some(bc) = &browser_context_id {
+            // A hostile page must not be able to drop files into the profile.
+            let _ = client
+                .call_timeout(
+                    "Browser.setDownloadBehavior",
+                    json!({ "behavior": "deny", "browserContextId": bc }),
+                    None,
+                    CLOSE_TIMEOUT,
+                )
+                .await;
+        }
 
         let mut create_params = json!({ "url": "about:blank" });
         if let Some(bc) = &browser_context_id {
@@ -357,6 +374,7 @@ impl BrowserEngine for CdpEngine {
             .to_string();
 
         self.in_use.fetch_add(1, Ordering::SeqCst);
+        ctx_guard.0 = None;
 
         let mut sessions = std::collections::HashSet::new();
         sessions.insert(session_id.clone());
@@ -575,9 +593,12 @@ impl CdpContext {
             .clone()
             .ok_or_else(|| BrowserError::Cdp("no frame id".into()))?;
         let world = self
-            .call(
+            .client
+            .call_timeout(
                 "Page.createIsolatedWorld",
                 json!({ "frameId": frame_id, "worldName": "cobweb", "grantUniveralAccess": true }),
+                self.sid(),
+                timeout.min(Duration::from_secs(5)),
             )
             .await?;
         let ctx_id = world
@@ -700,11 +721,13 @@ impl CdpContext {
         trigger: &Url,
         url: Url,
         request_headers: Vec<(String, String)>,
+        kind: Option<StreamKind>,
     ) -> SniffHit {
         SniffHit {
             url,
             request_headers,
             final_url: self.current_url(trigger).await,
+            kind,
         }
     }
 
@@ -896,7 +919,7 @@ impl BrowserContext for CdpContext {
                     let purl = purl.clone();
                     tracing::debug!(%purl, extra_info = have_extra, "sniff matched (url pattern)");
                     return Ok(self
-                        .hit(trigger, purl, merge_header_lists(base, extra))
+                        .hit(trigger, purl, merge_header_lists(base, extra), None)
                         .await);
                 }
             }
@@ -985,7 +1008,7 @@ impl BrowserContext for CdpContext {
                             }
                         }
                         tracing::debug!(%url, "sniff matched (url pattern)");
-                        return Ok(self.hit(trigger, url, headers).await);
+                        return Ok(self.hit(trigger, url, headers, None).await);
                     }
                     if let Some(id) = req_id {
                         let r = reqs.entry(id).or_default();
@@ -1056,7 +1079,12 @@ impl BrowserContext for CdpContext {
                             ),
                         };
                         tracing::debug!(%url, %mime, "sniff matched (mime type)");
-                        return Ok(self.hit(trigger, url, headers).await);
+                        let kind = if mime.to_ascii_lowercase().contains("dash") {
+                            StreamKind::Dash
+                        } else {
+                            StreamKind::Hls
+                        };
+                        return Ok(self.hit(trigger, url, headers, Some(kind)).await);
                     }
 
                     // (1b) glob match only visible at response time (redirects)
@@ -1068,7 +1096,7 @@ impl BrowserContext for CdpContext {
                                 .map(|r| merge_header_lists(r.headers, r.extra_headers))
                                 .unwrap_or_default();
                             tracing::debug!(%url, "sniff matched (url pattern, response)");
-                            return Ok(self.hit(trigger, url, headers).await);
+                            return Ok(self.hit(trigger, url, headers, None).await);
                         }
                     }
                 }
@@ -1097,12 +1125,14 @@ impl BrowserContext for CdpContext {
                     }
                     body_reads += 1;
 
+                    // Short: awaited inline, it holds up the sniff loop.
                     let got = self
                         .client
-                        .call(
+                        .call_timeout(
                             "Network.getResponseBody",
                             json!({ "requestId": id }),
                             e.session_id.as_deref(),
+                            Duration::from_secs(3),
                         )
                         .await;
                     let Ok(got) = got else { continue };
@@ -1115,11 +1145,14 @@ impl BrowserContext for CdpContext {
                         let n = raw.len().min(24 * 1024) / 4 * 4; // whole base64 quanta
                         base64::engine::general_purpose::STANDARD
                             .decode(&raw[..n])
-                            .ok()
-                            .and_then(|b| String::from_utf8(b).ok())
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
                             .unwrap_or_default()
                     } else {
-                        raw.get(..16 * 1024).unwrap_or(raw).to_string()
+                        let mut n = raw.len().min(16 * 1024);
+                        while !raw.is_char_boundary(n) {
+                            n -= 1;
+                        }
+                        raw[..n].to_string()
                     };
 
                     if body_is_manifest(&text) {
@@ -1127,7 +1160,12 @@ impl BrowserContext for CdpContext {
                             let url = r.url.unwrap_or_else(|| trigger.clone());
                             tracing::debug!(%url, "sniff matched (body)");
                             let headers = merge_header_lists(r.headers, r.extra_headers);
-                            return Ok(self.hit(trigger, url, headers).await);
+                            let kind = if text.trim_start().starts_with("#EXTM3U") {
+                                StreamKind::Hls
+                            } else {
+                                StreamKind::Dash
+                            };
+                            return Ok(self.hit(trigger, url, headers, Some(kind)).await);
                         }
                     }
                 }
@@ -1179,26 +1217,47 @@ impl BrowserContext for CdpContext {
     }
 
     async fn close(self: Box<Self>) {
+        // Short timeouts: a wedged browser must not hold the request (and its
+        // permit) for a minute here; the watchdog in `CdpClient` relaunches it.
         let _ = self
             .client
-            .call(
+            .call_timeout(
                 "Target.closeTarget",
                 json!({ "targetId": self.target_id }),
                 None,
+                CLOSE_TIMEOUT,
             )
             .await;
         if let Some(bc) = &self.browser_context_id {
             let _ = self
                 .client
-                .call(
+                .call_timeout(
                     "Target.disposeBrowserContext",
                     json!({ "browserContextId": bc }),
                     None,
+                    CLOSE_TIMEOUT,
                 )
                 .await;
         }
         // `in_use` / `last_used` bookkeeping happens in `Drop` so it stays
         // correct even if `close()` is never reached (a panic unwinds past it).
+    }
+}
+
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Disposes a browser context (and so its targets) on drop unless disarmed.
+struct DisposeOnDrop(Option<(Arc<CdpClient>, Option<String>)>);
+
+impl Drop for DisposeOnDrop {
+    fn drop(&mut self) {
+        if let Some((client, Some(bc))) = self.0.take() {
+            client.notify(
+                "Target.disposeBrowserContext",
+                json!({ "browserContextId": bc }),
+                None,
+            );
+        }
     }
 }
 
@@ -1310,10 +1369,32 @@ async fn pinned_proxy_server(
     let addrs = crate::ssrf::vetted_socket_addrs(host, port, allow_private, settings)
         .await
         .map_err(|e| BrowserError::Unavailable(format!("proxy_url refused: {e}")))?;
-    let ip = addrs[0].ip();
     let mut pinned = proxy.clone();
-    let _ = pinned.set_ip_host(ip);
-    Ok(pinned.as_str().trim_end_matches('/').to_string())
+    let _ = pinned.set_ip_host(addrs[0].ip());
+    chromium_proxy_server(&pinned)
+}
+
+/// An egress proxy URL in the form Chromium's `proxyServer` accepts. Chromium
+/// knows no `socks5h`/`socks4a` (it already resolves names at a SOCKS5 proxy,
+/// and fails every navigation with ERR_NO_SUPPORTED_PROXIES on the `h` form)
+/// and ignores userinfo, so a proxy that needs credentials is refused here
+/// instead of failing later with a 407 or a refused SOCKS handshake.
+fn chromium_proxy_server(proxy: &Url) -> BrowserResult<String> {
+    if !proxy.username().is_empty() || proxy.password().is_some() {
+        return Err(BrowserError::Unavailable(
+            "the browser tier can't use a proxy that needs credentials".into(),
+        ));
+    }
+    let scheme = match proxy.scheme() {
+        "socks5h" => "socks5",
+        "socks4a" => "socks4",
+        s => s,
+    };
+    let host = proxy.host_str().unwrap_or_default();
+    Ok(match proxy.port_or_known_default() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    })
 }
 
 /// `Target.setAutoAttach` params used for the page and, recursively, every
@@ -1668,7 +1749,23 @@ fn cdp_to_cookie(v: &Value) -> Option<Cookie> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fetch_guard_decision, merge_header_lists, FetchDecision};
+    use super::{chromium_proxy_server, fetch_guard_decision, merge_header_lists, FetchDecision};
+    use url::Url;
+
+    #[test]
+    fn chromium_proxy_server_maps_schemes_and_refuses_credentials() {
+        let cp = |u: &str| chromium_proxy_server(&Url::parse(u).unwrap());
+        assert_eq!(
+            cp("socks5h://127.0.0.1:40000").unwrap(),
+            "socks5://127.0.0.1:40000"
+        );
+        assert_eq!(cp("socks4a://[::1]:1080/").unwrap(), "socks4://[::1]:1080");
+        assert_eq!(
+            cp("http://proxy.lan:3128").unwrap(),
+            "http://proxy.lan:3128"
+        );
+        assert!(cp("socks5://user:pw@mullvad:1080").is_err());
+    }
 
     fn pair(k: &str, v: &str) -> (String, String) {
         (k.to_string(), v.to_string())
