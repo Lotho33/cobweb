@@ -72,7 +72,6 @@ impl Chromium {
         let (evt_rd, evt_wr) =
             cloexec_pipe().map_err(|e| BrowserError::Unavailable(format!("cdp pipe: {e}")))?;
 
-
         // Pin a real desktop-Chrome UA + Accept-Language at the network layer so
         // every frame/worker request is consistent (CDP overrides race with
         // same-origin subframes and mangle Accept-Language q-values).
