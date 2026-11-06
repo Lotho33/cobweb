@@ -125,7 +125,7 @@ async fn sniffs_a_url_a_page_script_fetches() {
     let patterns = build_globset(&["*.m3u8".to_string()]).unwrap();
 
     let hit = cx
-        .sniff(&trigger, &patterns, Duration::from_secs(20), None)
+        .sniff(&trigger, &patterns, Duration::from_secs(20), None, None)
         .await
         .expect("sniff should catch the fetch");
     assert!(
@@ -382,7 +382,7 @@ async fn sniffs_a_manifest_fetched_by_a_cross_site_iframe() {
     let trigger = Url::parse(&format!("http://127.0.0.1:{port}/outer")).unwrap();
     let patterns = build_globset(&["*.m3u8".to_string()]).unwrap();
     let hit = cx
-        .sniff(&trigger, &patterns, Duration::from_secs(20), None)
+        .sniff(&trigger, &patterns, Duration::from_secs(20), None, None)
         .await
         .expect("sniff should catch the iframe's fetch");
     assert!(
@@ -435,4 +435,128 @@ async fn direct_browser_traffic_rides_the_egress_proxy() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     assert!(conn.eq_ignore_ascii_case("close"), "connection: {conn:?}");
+}
+
+/// An embed that answers a plain 403 unless the navigation carries a Referer
+/// (as vixcloud does): with `referer` the sniff gets past it and catches the
+/// manifest.
+#[tokio::test]
+async fn sniff_sends_the_referer_it_is_given() {
+    if !have_chromium() {
+        eprintln!("skip sniff_sends_the_referer_it_is_given: no chromium on PATH");
+        return;
+    }
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/embed"))
+        .and(wiremock::matchers::header_exists("referer"))
+        .respond_with(html_page(
+            r#"<html><body>player
+               <script>fetch('/media/master.m3u8').catch(function(){});</script>
+               </body></html>"#,
+        ))
+        .with_priority(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/embed"))
+        .respond_with(ResponseTemplate::new(403).set_body_raw(
+            b"<html><head><title>Forbidden</title></head><body>403</body></html>".to_vec(),
+            "text/html",
+        ))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/media/master.m3u8"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("#EXTM3U"))
+        .mount(&upstream)
+        .await;
+
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, true, no_blocklist());
+    engine.ensure_ready().await.expect("Chromium should launch");
+    let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
+    let trigger = Url::parse(&format!("{}/embed", upstream.uri())).unwrap();
+    let patterns = build_globset(&["*.m3u8".to_string()]).unwrap();
+    let referer = format!("{}/", upstream.uri());
+
+    let hit = cx
+        .sniff(
+            &trigger,
+            &patterns,
+            Duration::from_secs(20),
+            None,
+            Some(referer.as_str()),
+        )
+        .await
+        .expect("with a Referer the embed loads and the manifest is caught");
+    assert!(
+        hit.url.as_str().ends_with("/media/master.m3u8"),
+        "got {}",
+        hit.url
+    );
+
+    cx.close().await;
+    engine.shutdown().await;
+}
+
+/// A plain 403 of the top document (no Cloudflare markers, no
+/// `cf-mitigated`) is the site refusing, not a challenge: `Forbidden`, and
+/// well before the sniff timeout. A `cf-mitigated: challenge` 403 stays a
+/// `Challenge`.
+#[tokio::test]
+async fn plain_403_is_forbidden_but_cf_mitigated_is_a_challenge() {
+    use cobweb::browser::BrowserError;
+    if !have_chromium() {
+        eprintln!(
+            "skip plain_403_is_forbidden_but_cf_mitigated_is_a_challenge: no chromium on PATH"
+        );
+        return;
+    }
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/plain"))
+        .respond_with(ResponseTemplate::new(403).set_body_raw(
+            b"<html><head><title>Forbidden</title></head><body>403</body></html>".to_vec(),
+            "text/html",
+        ))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/cf"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("cf-mitigated", "challenge")
+                .set_body_raw(b"<html><body>wait</body></html>".to_vec(), "text/html"),
+        )
+        .mount(&upstream)
+        .await;
+
+    let engine = CdpEngine::new(headless_cfg(), 2, 0, true, no_blocklist());
+    engine.ensure_ready().await.expect("Chromium should launch");
+    let patterns = build_globset(&["*.m3u8".to_string()]).unwrap();
+
+    let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
+    let started = std::time::Instant::now();
+    let trigger = Url::parse(&format!("{}/plain", upstream.uri())).unwrap();
+    let err = cx
+        .sniff(&trigger, &patterns, Duration::from_secs(30), None, None)
+        .await
+        .expect_err("a 403 page never fires the manifest");
+    assert!(matches!(err, BrowserError::Forbidden(403)), "got {err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "should give up early, took {:?}",
+        started.elapsed()
+    );
+    cx.close().await;
+
+    let mut cx = engine.acquire(ctx_opts().await).await.expect("acquire");
+    let trigger = Url::parse(&format!("{}/cf", upstream.uri())).unwrap();
+    let err = cx
+        .sniff(&trigger, &patterns, Duration::from_secs(8), None, None)
+        .await
+        .expect_err("a challenge page never fires the manifest");
+    assert!(matches!(err, BrowserError::Challenge), "got {err:?}");
+    cx.close().await;
+    engine.shutdown().await;
 }

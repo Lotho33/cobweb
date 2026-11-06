@@ -140,6 +140,8 @@ pub struct ResolveCtx<'a> {
     pub jar: Option<&'a JarEntry>,
     /// Optional JS to run after load during a browser sniff (`/v1/sniff` only).
     pub interact_js: Option<&'a str>,
+    /// Optional Referer for the browser navigation (`/v1/sniff` only).
+    pub referer: Option<&'a str>,
 }
 
 #[async_trait]
@@ -280,7 +282,13 @@ impl Tier for BrowserSniffTier {
         };
 
         let outcome = match cx
-            .sniff(ctx.url, ctx.url_pattern, ctx.timeout, ctx.interact_js)
+            .sniff(
+                ctx.url,
+                ctx.url_pattern,
+                ctx.timeout,
+                ctx.interact_js,
+                ctx.referer,
+            )
             .await
         {
             Ok(hit) => {
@@ -298,6 +306,12 @@ impl Tier for BrowserSniffTier {
                 })
             }
             Err(BrowserError::Challenge) => TierOutcome::Escalate(EscalateReason::Challenge),
+            // A plain 403/503 from the site itself: a challenge solver can't
+            // fix it, so say what happened instead of asking for a manual solve.
+            Err(BrowserError::Forbidden(s)) => TierOutcome::Failed(CobwebError::Upstream(format!(
+                "{}: page answered HTTP {s} (not a Cloudflare challenge: missing Referer or auth?)",
+                ctx.registrable_domain
+            ))),
             Err(BrowserError::NoMatch | BrowserError::Timeout(_)) => {
                 TierOutcome::Escalate(EscalateReason::NotFound)
             }
@@ -508,6 +522,7 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
         block_trackers: params.block_trackers,
         jar: jar_entry.as_ref(),
         interact_js: None,
+        referer: None,
     };
 
     let mut last_reason = EscalateReason::NeedsJs;
@@ -663,6 +678,7 @@ async fn try_flaresolverr(
         block_trackers: params.block_trackers,
         jar: fresh.as_ref(),
         interact_js: None,
+        referer: None,
     };
     Some(browser_tier.try_resolve(&ctx).await)
 }
@@ -840,6 +856,15 @@ pub fn normalize_sniff_pattern(p: &str) -> String {
     }
 }
 
+/// Optional browser-side hints for `/v1/sniff`.
+#[derive(Debug, Default, Clone)]
+pub struct SniffHints {
+    /// JS run (isolated world) after load, retried until truthy.
+    pub interact_js: Option<String>,
+    /// Referer for the navigation to the trigger URL.
+    pub referer: Option<String>,
+}
+
 pub async fn browser_sniff(
     state: &AppState,
     trigger: Url,
@@ -847,7 +872,7 @@ pub async fn browser_sniff(
     egress_name: Option<String>,
     proxy_url: Option<String>,
     timeout: Duration,
-    interact_js: Option<String>,
+    hints: SniffHints,
 ) -> Result<SniffResult> {
     let tier = state.browser_tier.as_ref().ok_or_else(|| {
         CobwebError::NeedsBrowser(
@@ -875,7 +900,8 @@ pub async fn browser_sniff(
         block_resources: true,
         block_trackers: true,
         jar: jar_entry.as_ref(),
-        interact_js: interact_js.as_deref(),
+        interact_js: hints.interact_js.as_deref(),
+        referer: hints.referer.as_deref().filter(|r| !r.is_empty()),
     };
 
     match tier.try_resolve(&ctx).await {

@@ -294,6 +294,7 @@ pub async fn sniff(
         egress,
         proxy_url,
         interact_js,
+        referer,
         ..
     } = req;
 
@@ -304,7 +305,10 @@ pub async fn sniff(
         egress,
         proxy_url,
         timeout,
-        interact_js,
+        pipeline::SniffHints {
+            interact_js,
+            referer,
+        },
     )
     .await?;
 

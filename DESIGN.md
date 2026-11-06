@@ -309,7 +309,7 @@ Existing cobweb contract (mycelium's `browser_client.go` expects these verbatim)
 | `GET /health` | — | `{ready, engine, contexts_in_use, jar_domains}` |
 | `POST /v1/navigate` | `{url, wait_for?, timeout_ms?, proxy_url?, egress?}` | `{html, final_url}` |
 | `POST /v1/eval` | `{url, js, timeout_ms?, proxy_url?, egress?}` | `{result}` |
-| `POST /v1/sniff` | `{trigger_url, url_pattern, timeout_ms?, proxy_url?, egress?}` | `{intercepted_url, headers}` |
+| `POST /v1/sniff` | `{trigger_url, url_pattern, timeout_ms?, proxy_url?, egress?, interact_js?, referer?}` | `{intercepted_url, headers}`; a plain 403/503 of the top document (no Cloudflare markers, no `cf-mitigated: challenge`) fails fast as `upstream` ("not a Cloudflare challenge"), not `needs_manual_solve` |
 
 (`/v1/session/*` and `/vnc/*` — the tier-4 manual-solve surface — no longer
 exist; see the note at the top of this document.)

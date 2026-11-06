@@ -771,6 +771,7 @@ impl BrowserContext for CdpContext {
         pattern: &GlobSet,
         timeout: Duration,
         interact_js: Option<&str>,
+        referer: Option<&str>,
     ) -> BrowserResult<SniffHit> {
         let mut ev = self.client.subscribe();
 
@@ -779,14 +780,22 @@ impl BrowserContext for CdpContext {
         // auto-attaches those paused and the guard task instruments each one
         // (Network/Fetch/…) before resuming it, so its *.m3u8 request shows
         // up on this stream under a session in `self.sessions`.
-        let nav = self
-            .call("Page.navigate", json!({ "url": trigger.as_str() }))
-            .await?;
+        let mut nav_params = json!({ "url": trigger.as_str() });
+        if let Some(r) = referer.filter(|r| !r.is_empty()) {
+            nav_params["referrer"] = json!(r);
+        }
+        let nav = self.call("Page.navigate", nav_params).await?;
         if let Some(err) = nav.get("errorText").and_then(Value::as_str) {
             if !err.is_empty() {
                 return Err(BrowserError::Cdp(format!("navigate: {err}")));
             }
         }
+        // The top-level frame: its Document responses decide "the page itself
+        // refused" (a 403/503 from an ad iframe must not).
+        let main_frame = nav
+            .get("frameId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         // Per-request state, so a mime-type / body match on the *response* can
         // still hand back the URL + replay headers.
@@ -813,7 +822,17 @@ impl BrowserContext for CdpContext {
         const MAX_TRACKED_REQS: usize = 512;
 
         let deadline = Instant::now() + timeout;
-        let mut doc_403 = false;
+        // Any Document (any frame) that Cloudflare marked as a challenge
+        // (`cf-mitigated: challenge` — set on every challenge response, and
+        // the only reliable signal for a challenged cross-origin iframe whose
+        // DOM we never read).
+        let mut cf_mitigated = false;
+        // Latest status of the top-level document, and since when it holds.
+        // A plain 403/503 there (no challenge markers) is the site refusing —
+        // e.g. an embed opened without the Referer it wants — and waiting the
+        // full timeout for a stream that will never come is pointless.
+        let mut main_doc: Option<(i64, Instant)> = None;
+        const FORBIDDEN_GRACE: Duration = Duration::from_secs(6);
 
         // A URL-pattern match on `requestWillBeSent` is held for a short grace
         // period so that request's `requestWillBeSentExtraInfo` — carrying the
@@ -882,7 +901,7 @@ impl BrowserContext for CdpContext {
             if Instant::now() >= next_probe && !remaining.is_zero() {
                 next_probe = Instant::now() + PROBE_EVERY;
                 let head = self.current_html_head().await;
-                if looks_like_cloudflare_challenge(200, &head, None) {
+                if cf_mitigated || looks_like_cloudflare_challenge(200, &head, None) {
                     match challenge_since {
                         None => {
                             challenge_since = Some(Instant::now());
@@ -899,8 +918,19 @@ impl BrowserContext for CdpContext {
                         }
                         Some(_) => {}
                     }
-                } else if challenge_since.take().is_some() {
-                    tracing::info!("sniff: interstitial cleared on its own, continuing");
+                } else {
+                    if challenge_since.take().is_some() {
+                        tracing::info!("sniff: interstitial cleared on its own, continuing");
+                    }
+                    if let Some((s @ (403 | 503), since)) = main_doc {
+                        if since.elapsed() >= FORBIDDEN_GRACE && pending.is_none() {
+                            tracing::info!(
+                                status = s,
+                                "sniff: page answered a plain {s} (no challenge) — giving up early"
+                            );
+                            return Err(BrowserError::Forbidden(s as u16));
+                        }
+                    }
                 }
             }
 
@@ -1047,8 +1077,25 @@ impl BrowserContext for CdpContext {
                         .pointer("/response/status")
                         .and_then(Value::as_i64)
                         .unwrap_or(0);
-                    if rtype == "Document" && (status == 403 || status == 503) {
-                        doc_403 = true;
+                    if rtype == "Document" {
+                        let headers = e.params.pointer("/response/headers");
+                        if header_ci(headers, "cf-mitigated")
+                            .is_some_and(|v| v.eq_ignore_ascii_case("challenge"))
+                        {
+                            cf_mitigated = true;
+                        }
+                        let frame = e.params.get("frameId").and_then(Value::as_str);
+                        // Main page events carry our own (flattened) session
+                        // id; OOPIF targets have theirs.
+                        if e.session_id.as_deref().is_none_or(|s| s == self.session_id)
+                            && main_frame.is_some()
+                            && frame == main_frame.as_deref()
+                        {
+                            main_doc = match main_doc {
+                                Some((s, t)) if s == status => Some((s, t)),
+                                _ => Some((status, Instant::now())),
+                            };
+                        }
                     }
 
                     if let Some(id) = &req_id {
@@ -1181,8 +1228,10 @@ impl BrowserContext for CdpContext {
             .unwrap_or_else(|e| e.into_inner())
             .len();
         tracing::debug!(sessions = session_count, "sniff gave up with no match");
-        if doc_403 || looks_like_cloudflare_challenge(200, &html, None) {
+        if cf_mitigated || looks_like_cloudflare_challenge(200, &html, None) {
             Err(BrowserError::Challenge)
+        } else if let Some((s @ (403 | 503), _)) = main_doc {
+            Err(BrowserError::Forbidden(s as u16))
         } else {
             Err(BrowserError::NoMatch)
         }
@@ -1695,6 +1744,14 @@ fn merge_header_lists(
 }
 
 /// CDP headers object -> `Vec<(name, value)>`.
+/// Case-insensitive lookup in a CDP header object (`{"Name": "value"}`).
+fn header_ci<'a>(v: Option<&'a Value>, name: &str) -> Option<&'a str> {
+    v.and_then(Value::as_object)?
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .and_then(|(_, v)| v.as_str())
+}
+
 fn header_map(v: Option<&Value>) -> Vec<(String, String)> {
     v.and_then(Value::as_object)
         .map(|m| {

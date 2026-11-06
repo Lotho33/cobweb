@@ -118,6 +118,9 @@ impl From<crate::browser::BrowserError> for CobwebError {
             // Challenge carries no domain here; callers that can name the domain
             // (the pipeline) intercept it before converting.
             B::Challenge => CobwebError::Browser("landed on a challenge page".into()),
+            B::Forbidden(s) => CobwebError::Upstream(format!(
+                "page answered HTTP {s} (not a Cloudflare challenge: missing Referer or auth?)"
+            )),
             B::Unavailable(m) => CobwebError::Browser(format!("engine unavailable: {m}")),
             B::Timeout(d) => CobwebError::Browser(format!("timed out after {d:?}")),
             B::NoMatch => CobwebError::NotResolved("no request matched the pattern".into()),

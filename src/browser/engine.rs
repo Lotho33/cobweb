@@ -27,6 +27,12 @@ pub enum BrowserError {
     /// Landed on a Cloudflare / managed-challenge interstitial.
     #[error("landed on a challenge page")]
     Challenge,
+    /// The top-level document answered 403/503 with no sign of a Cloudflare
+    /// challenge (no interstitial markers, no `cf-mitigated: challenge`): the
+    /// site itself refused — e.g. an embed that wants a Referer. Not
+    /// something a challenge solver can fix.
+    #[error("page answered HTTP {0} (not a challenge)")]
+    Forbidden(u16),
     /// Navigation finished but nothing matched `url_pattern`.
     #[error("no request matched the pattern")]
     NoMatch,
@@ -121,8 +127,10 @@ pub trait BrowserContext: Send {
         timeout: Duration,
     ) -> BrowserResult<PageLoad>;
 
-    /// Navigate to `trigger`, then resolve when a request/response URL matches
-    /// `pattern`. `Err(Challenge)` if it lands on a challenge first.
+    /// Navigate to `trigger` (sending `referer` as the navigation's Referer,
+    /// if given), then resolve when a request/response URL matches `pattern`.
+    /// `Err(Challenge)` if it lands on a challenge first, `Err(Forbidden)` if
+    /// the page itself refuses with a plain 403/503.
     /// **Must not enable the `Runtime` domain.**
     async fn sniff(
         &mut self,
@@ -130,6 +138,7 @@ pub trait BrowserContext: Send {
         pattern: &GlobSet,
         timeout: Duration,
         interact_js: Option<&str>,
+        referer: Option<&str>,
     ) -> BrowserResult<SniffHit>;
 
     /// Run `js` in a fresh `Page.createIsolatedWorld`; returns the JSON result.

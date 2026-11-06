@@ -169,6 +169,11 @@ pub struct SniffRequest {
     /// the request the sniff is waiting for.
     #[serde(default)]
     pub interact_js: Option<String>,
+    /// Referer for the navigation to `trigger_url`. Some embeds (vixcloud)
+    /// answer a plain 403 when it is missing, exactly as when the page is
+    /// opened directly instead of from the site that embeds it.
+    #[serde(default)]
+    pub referer: Option<String>,
 }
 
 impl SniffRequest {

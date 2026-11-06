@@ -171,6 +171,7 @@ impl BrowserContext for MockContext {
         _pattern: &GlobSet,
         timeout: Duration,
         _interact_js: Option<&str>,
+        _referer: Option<&str>,
     ) -> BrowserResult<SniffHit> {
         match &self.sniff {
             SniffScript::Hit { url, headers } => {
