@@ -24,9 +24,11 @@ use crate::config::BrowserConfig;
 use crate::fastpath::{looks_like_cloudflare_challenge, StreamKind};
 use crate::jar::{Cookie, StorageState};
 
-// `navigator.webdriver` is already false (`--disable-blink-features=
-// AutomationControlled`); redefining it would add a detectable own property.
-const STEALTH_JS: &str = r#"
+// Headless Chromium has no `window.chrome`, which some player scripts read
+// unguarded and throw on; an empty stub lets them run. Nothing else is
+// patched (`navigator.webdriver` already comes from
+// `--disable-blink-features=AutomationControlled`).
+const CHROME_OBJECT_SHIM_JS: &str = r#"
 window.chrome = window.chrome || { runtime: {} };
 "#;
 
@@ -546,7 +548,7 @@ impl CdpContext {
         let script_fut = async {
             self.call(
                 "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": STEALTH_JS }),
+                json!({ "source": CHROME_OBJECT_SHIM_JS }),
             )
             .await
             .map(|_| ())
@@ -1392,7 +1394,8 @@ fn fetch_guard_decision(
             return FetchDecision::Block("blocklisted tracker/ad domain");
         }
     }
-    let lower = host.to_ascii_lowercase();
+    // Trailing dot stripped, as in `ssrf::redirect_block_reason`.
+    let lower = bare.trim_end_matches('.').to_ascii_lowercase();
     if !allow_private && (lower == "localhost" || lower.ends_with(".localhost")) {
         return FetchDecision::Block("localhost");
     }
@@ -1655,7 +1658,7 @@ async fn adopt_child(g: &GuardCtx, params: &Value) {
         c.call("Page.enable", json!({}), s),
         c.call(
             "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": STEALTH_JS }),
+            json!({ "source": CHROME_OBJECT_SHIM_JS }),
             s,
         ),
         c.call("Target.setAutoAttach", auto_attach_params(), s),
@@ -1839,6 +1842,8 @@ mod tests {
             "http://169.254.169.254/latest/meta-data/",
             "http://10.0.0.5:6379",
             "http://[::1]/",
+            "http://localhost./",
+            "ws://a.localhost.:9222/",
         ] {
             assert!(
                 matches!(

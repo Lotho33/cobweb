@@ -87,5 +87,8 @@ jobs:
           context: .
           platforms: linux/amd64
           push: false
+          # Same features as the published image (release.yml).
+          build-args: |
+            FEATURES=flaresolverr
           cache-from: type=gha
           cache-to: type=gha,mode=max

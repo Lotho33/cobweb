@@ -7,8 +7,8 @@
 #
 #   make test | check | fmt | run | shell
 #
-# Default features (flaresolverr) are on. `ytdlp` is opt-in:
-#   cargo test --features ytdlp
+# No optional features are on by default (`flaresolverr`, `ytdlp` are opt-in);
+# test/check build them all, matching CI (--all-features).
 
 HAVE_CARGO := $(shell command -v cargo >/dev/null 2>&1 && echo yes)
 
@@ -25,10 +25,10 @@ endif
 
 .PHONY: test check fmt run shell build-image
 test:
-	$(call cargo,cargo test)
+	$(call cargo,cargo test --all-features)
 
 check:
-	$(call cargo,cargo clippy --all-targets -- -D warnings)
+	$(call cargo,cargo clippy --all-targets --all-features -- -D warnings)
 
 fmt:
 	$(call cargo,cargo fmt)

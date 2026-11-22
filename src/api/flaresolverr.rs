@@ -82,7 +82,20 @@ async fn dispatch(_st: &AppState, req: V1Request, started: u128) -> Value {
 #[cfg(feature = "flaresolverr")]
 async fn dispatch(st: &AppState, req: V1Request, started: u128) -> Value {
     match req.cmd.as_str() {
-        "request.get" => request_get(st, req, started).await,
+        "request.get" => {
+            // Same overall cap as the native browser routes: `acquire` waits
+            // for a free context with no deadline of its own.
+            let budget = crate::pipeline::request_budget(request_timeout(&req));
+            match tokio::time::timeout(budget, request_get(st, req, started)).await {
+                Ok(v) => v,
+                Err(_) => envelope(
+                    "error",
+                    &format!("request.get exceeded its {}s budget", budget.as_secs()),
+                    started,
+                    json!({}),
+                ),
+            }
+        }
         "request.post" => envelope(
             "error",
             "request.post is not implemented (use request.get)",
@@ -101,12 +114,17 @@ async fn dispatch(st: &AppState, req: V1Request, started: u128) -> Value {
     }
 }
 
+/// `maxTimeout` (default 60 s), clamped to 5–180 s.
+#[cfg(feature = "flaresolverr")]
+fn request_timeout(req: &V1Request) -> std::time::Duration {
+    std::time::Duration::from_millis(req.max_timeout.unwrap_or(60_000).clamp(5_000, 180_000))
+}
+
 #[cfg(feature = "flaresolverr")]
 async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
     use crate::browser::{ContextOptions, WaitFor};
     use crate::jar::JarEntry;
     use crate::pipeline::registrable_domain;
-    use std::time::Duration;
     use url::Url;
 
     let Some(url_s) = req.url.as_deref() else {
@@ -128,15 +146,15 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
         Ok(e) => e,
         Err(e) => return envelope("error", &e.to_string(), started, json!({})),
     };
+    if let Err(e) = crate::ssrf::guard_url(&url, st.config.server.allow_private_targets) {
+        return envelope("error", &e.to_string(), started, json!({}));
+    }
     if let Err(e) =
         crate::ssrf::guard_egress(&egress, st.config.server.private_proxy_hosts_ok()).await
     {
         return envelope("error", &e.to_string(), started, json!({}));
     }
     if let Err(e) = st.egress.ensure_available(&egress).await {
-        return envelope("error", &e.to_string(), started, json!({}));
-    }
-    if let Err(e) = crate::ssrf::guard_url(&url, st.config.server.allow_private_targets) {
         return envelope("error", &e.to_string(), started, json!({}));
     }
     // Only now: an invalid request must not launch Chromium.
@@ -157,7 +175,7 @@ async fn request_get(st: &AppState, req: V1Request, started: u128) -> Value {
     };
     let seed = st.jar.load_key(&jar_domain, &jar_egress).await;
 
-    let timeout = Duration::from_millis(req.max_timeout.unwrap_or(60_000).clamp(5_000, 180_000));
+    let timeout = request_timeout(&req);
     let opts = ContextOptions {
         egress: (*egress).clone(),
         seed: seed.as_ref().map(|j| j.storage_state.clone()),

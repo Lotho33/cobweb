@@ -25,11 +25,12 @@ Requests go through tiers, cheapest first:
 2. **Browser sniff** — a single headless Chromium, driven over the DevTools
    protocol, watches the network for the `*.m3u8` / `*.mpd` the page
    requests. Used only when the fast path can't see the URL.
-3. **FlareSolverr delegate** *(optional)* — hand a hard page to an external,
-   separately-run FlareSolverr instance and retry the sniff with the cookies
-   it returns. Point `[flaresolverr].endpoint` at it; unset by default. Its
-   browser has no SSRF guard of its own: run it on an isolated container
-   network, not the host's.
+3. **FlareSolverr delegate** *(optional, build with `--features
+   flaresolverr`)* — hand a hard page to an external, separately-run
+   FlareSolverr instance and retry the sniff with the cookies it returns.
+   Point `[flaresolverr].endpoint` at it; unset by default. Its browser has
+   no SSRF guard of its own: run it on an isolated container network, not
+   the host's.
 
 If every tier fails on a challenge, cobweb returns a structured
 `needs_manual_solve` error — it has no interactive solve capability of its
@@ -43,8 +44,11 @@ Supporting pieces:
   session established once is reused by later automated calls until it expires.
 - **Modular egress** — named VPN/proxy profiles chosen per request; no always-on
   global tunnel. Fail-closed if the chosen proxy is unreachable.
-- **FlareSolverr-compatible API** — cobweb also *speaks* the FlareSolverr v1
-  API, so it can be dropped in where one is already expected.
+- **FlareSolverr-compatible API** *(optional, `--features flaresolverr`)* —
+  cobweb can also *speak* the FlareSolverr v1 request format, so tools that
+  already have a FlareSolverr client can use it without changes. It is only
+  a wire format: requests run through the same headless browser as above,
+  and a challenge page comes back as an error, not solved.
 
 See **[DESIGN.md](DESIGN.md)** for the full rationale.
 
@@ -83,8 +87,13 @@ curl -s localhost:8191/v1/resolve \
 
 | feature | default | what |
 |---|:---:|---|
-| `flaresolverr` | ✅ | inbound FS-compatible API + outbound delegate |
+| `flaresolverr` | — | opt-in: FS-compatible API (`POST /v1`) + outbound delegate |
 | `ytdlp` | — | opt-in: shell out to a `yt-dlp` binary for hosts it handles |
+
+Nothing optional is compiled by default (`cargo build`, `docker build .`).
+The published `ghcr.io` image is built with `FEATURES=flaresolverr`, so
+existing deployments keep the delegate; build your own with
+`docker build --build-arg FEATURES="" .` to leave it out.
 
 ## License
 

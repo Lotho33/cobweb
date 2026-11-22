@@ -104,6 +104,11 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           provenance: false
+          # The published image keeps the FlareSolverr delegate/API it has
+          # always shipped with (deployments auto-update via Watchtower);
+          # only the crate/Dockerfile default is opt-in.
+          build-args: |
+            FEATURES=flaresolverr
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
           outputs: type=image,name=${{ needs.vars.outputs.image }},push-by-digest=true,name-canonical=true,push=true

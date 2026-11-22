@@ -77,7 +77,8 @@ proxy = "socks5h://proton:1080"
 proxy = "socks5h://warp:1080"
 
 # ─── Optional: delegate hard challenges to an external FlareSolverr ───────────
-# Unset `endpoint` to disable tier 3b. When set, a challenge cobweb's own browser
+# Needs a build with `--features flaresolverr` (ignored otherwise, with a
+# startup warning). Unset `endpoint` to disable tier 3b. When set, a challenge cobweb's own browser
 # can't pass is forwarded here; the returned cookies are merged into the jar and
 # ridden by the fast-path until they go stale.
 [flaresolverr]

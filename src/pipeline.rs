@@ -438,6 +438,31 @@ pub fn registrable_domain(url: &Url) -> Result<String> {
     Ok(psl::domain_str(host).unwrap_or(host).to_ascii_lowercase())
 }
 
+/// Upper bound on a whole request given the caller's per-step `timeout`:
+/// room for the step itself, a retry, and CDP setup/teardown — and, for the
+/// browser entry points, the wait for a free context when all
+/// `max_contexts` are busy (`acquire` has no deadline of its own).
+pub fn request_budget(timeout: Duration) -> Duration {
+    timeout * 2 + Duration::from_secs(15)
+}
+
+/// Run `fut` under [`request_budget`]. A cancelled browser context is still
+/// torn down and its permit released by `CdpContext`'s `Drop`.
+pub async fn with_budget<T>(
+    what: &str,
+    timeout: Duration,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let budget = request_budget(timeout);
+    match tokio::time::timeout(budget, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(CobwebError::Browser(format!(
+            "{what} exceeded its {}s budget",
+            budget.as_secs()
+        ))),
+    }
+}
+
 /// Run the pipeline (DESIGN.md §2) and record the outcome for `/metrics`.
 pub async fn resolve(state: &AppState, params: ResolveParams) -> Result<ResolveOutcome> {
     // Computed up front so errors are attributed to their domain too (they
@@ -446,14 +471,8 @@ pub async fn resolve(state: &AppState, params: ResolveParams) -> Result<ResolveO
     // Each tier gets the caller's timeout; this caps the whole chain (fast
     // path, browser, FlareSolverr + browser retry, plus CDP setup/teardown)
     // so a caller can rely on an upper bound.
-    let budget = params.timeout * 2 + Duration::from_secs(15);
-    let r = match tokio::time::timeout(budget, resolve_inner(state, params)).await {
-        Ok(r) => r,
-        Err(_) => Err(CobwebError::Browser(format!(
-            "resolve exceeded its {}s budget",
-            budget.as_secs()
-        ))),
-    };
+    let timeout = params.timeout;
+    let r = with_budget("resolve", timeout, resolve_inner(state, params)).await;
     match &r {
         Ok(o) => state.metrics.resolve_ok(&o.domain, o.via_tier),
         Err(CobwebError::NeedsManualSolve { domain }) => state.metrics.resolve_needs_manual(domain),
@@ -467,13 +486,13 @@ async fn resolve_inner(state: &AppState, params: ResolveParams) -> Result<Resolv
     let egress = state
         .egress
         .resolve(params.egress_name.as_deref(), params.proxy_url.as_deref())?;
+    // DNS-free target check first: a refused URL never costs a proxy probe.
+    crate::ssrf::guard_url(&params.url, state.config.server.allow_private_targets)?;
     // Vet a caller-supplied `proxy_url` *before* `ensure_available`'s
     // TCP-connect probe, which would otherwise double as a blind port-scan
     // oracle against an internal host named in the request.
     crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
-
-    crate::ssrf::guard_url(&params.url, state.config.server.allow_private_targets)?;
 
     // yt-dlp path: for configured hosts, shell out instead of running the tiers
     // (`[ytdlp].hosts` is an explicit operator allowlist; yt-dlp fetches on
@@ -786,9 +805,9 @@ pub async fn navigate_fastpath(
     let egress = state
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
+    crate::ssrf::guard_url(&url, state.config.server.allow_private_targets)?;
     crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
-    crate::ssrf::guard_url(&url, state.config.server.allow_private_targets)?;
     let jar = state.jar.get_fresh(&domain, &egress).await;
 
     let now = chrono::Utc::now().timestamp() as f64;
@@ -874,6 +893,31 @@ pub async fn browser_sniff(
     timeout: Duration,
     hints: SniffHints,
 ) -> Result<SniffResult> {
+    with_budget(
+        "sniff",
+        timeout,
+        browser_sniff_inner(
+            state,
+            trigger,
+            url_pattern,
+            egress_name,
+            proxy_url,
+            timeout,
+            hints,
+        ),
+    )
+    .await
+}
+
+async fn browser_sniff_inner(
+    state: &AppState,
+    trigger: Url,
+    url_pattern: Vec<String>,
+    egress_name: Option<String>,
+    proxy_url: Option<String>,
+    timeout: Duration,
+    hints: SniffHints,
+) -> Result<SniffResult> {
     let tier = state.browser_tier.as_ref().ok_or_else(|| {
         CobwebError::NeedsBrowser(
             "browser engine disabled — set browser_engine = \"chromium\"".into(),
@@ -884,9 +928,9 @@ pub async fn browser_sniff(
     let egress = state
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
+    crate::ssrf::guard_url(&trigger, state.config.server.allow_private_targets)?;
     crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
-    crate::ssrf::guard_url(&trigger, state.config.server.allow_private_targets)?;
     let jar_entry = state.jar.get_fresh(&domain, &egress).await;
     let globset = globset_for(&url_pattern)?;
 
@@ -931,6 +975,22 @@ pub async fn browser_eval(
     proxy_url: Option<String>,
     timeout: Duration,
 ) -> Result<serde_json::Value> {
+    with_budget(
+        "eval",
+        timeout,
+        browser_eval_inner(state, url, js, egress_name, proxy_url, timeout),
+    )
+    .await
+}
+
+async fn browser_eval_inner(
+    state: &AppState,
+    url: Url,
+    js: String,
+    egress_name: Option<String>,
+    proxy_url: Option<String>,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
     let engine = state.browser.as_ref().ok_or_else(|| {
         CobwebError::NeedsBrowser(
             "browser engine disabled — set browser_engine = \"chromium\"".into(),
@@ -945,9 +1005,9 @@ pub async fn browser_eval(
     let egress = state
         .egress
         .resolve(egress_name.as_deref(), proxy_url.as_deref())?;
+    crate::ssrf::guard_url(&url, state.config.server.allow_private_targets)?;
     crate::ssrf::guard_egress(&egress, state.config.server.private_proxy_hosts_ok()).await?;
     state.egress.ensure_available(&egress).await?;
-    crate::ssrf::guard_url(&url, state.config.server.allow_private_targets)?;
     let jar_entry = state.jar.get_fresh(&domain, &egress).await;
 
     let opts = ContextOptions {

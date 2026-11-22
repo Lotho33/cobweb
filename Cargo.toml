@@ -31,7 +31,12 @@ path = "src/lib.rs"
 # [flaresolverr].endpoint at your own separately-run FlareSolverr instance
 # (see README.md); that was already independent of `vnc` and needed no
 # changes here.
-default = ["flaresolverr"]
+#
+# `flaresolverr` is opt-in too: both the FlareSolverr-compatible API (`POST
+# /v1`, a drop-in for clients that already speak it) and the outbound
+# delegate to an operator-run FlareSolverr are compiled only on request.
+# cobweb itself never solves a challenge — it reports `needs_manual_solve`.
+default = []
 flaresolverr = []
 ytdlp        = []
 

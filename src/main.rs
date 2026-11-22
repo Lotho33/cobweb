@@ -25,6 +25,17 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    // Deprecated pre-rename env var: honour HYPHA_CONFIG when COBWEB_CONFIG is
+    // unset so existing deployments keep working. Remove after one release.
+    // Done here, before the runtime spawns any thread: `set_var` is not
+    // thread-safe (it is `unsafe` from edition 2024 for that reason).
+    if std::env::var_os("COBWEB_CONFIG").is_none() {
+        if let Some(v) = std::env::var_os("HYPHA_CONFIG") {
+            eprintln!("cobweb: HYPHA_CONFIG is deprecated, use COBWEB_CONFIG");
+            std::env::set_var("COBWEB_CONFIG", v);
+        }
+    }
+
     // A sidecar serves a handful of concurrent requests plus one Chromium; the
     // default (#CPU worker threads) is wasteful on a many-core host. 2 keeps the
     // CDP reader responsive while a sniff is parked in `.await` and a /v1/fetch
@@ -49,15 +60,6 @@ fn main() -> ExitCode {
 }
 
 async fn run() -> ExitCode {
-    // Deprecated pre-rename env var: honour HYPHA_CONFIG when COBWEB_CONFIG is
-    // unset so existing deployments keep working. Remove after one release.
-    if std::env::var_os("COBWEB_CONFIG").is_none() {
-        if let Some(v) = std::env::var_os("HYPHA_CONFIG") {
-            eprintln!("cobweb: HYPHA_CONFIG is deprecated, use COBWEB_CONFIG");
-            std::env::set_var("COBWEB_CONFIG", v);
-        }
-    }
-
     let cli = Cli::parse();
 
     let cfg = match Config::load(&cli.config).await {
@@ -113,6 +115,19 @@ async fn run() -> ExitCode {
                  socks5h:// to resolve at the proxy (the browser tier always does)."
             );
         }
+    }
+
+    #[cfg(not(feature = "flaresolverr"))]
+    if cfg
+        .flaresolverr
+        .endpoint
+        .as_deref()
+        .is_some_and(|e| !e.trim().is_empty())
+    {
+        tracing::warn!(
+            "[flaresolverr].endpoint is set but this build has no `flaresolverr` \
+             feature: the delegate is disabled (rebuild with --features flaresolverr)"
+        );
     }
 
     let addr = cfg.server.listen_addr();

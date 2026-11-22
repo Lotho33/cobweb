@@ -1,8 +1,8 @@
 # Multi-stage build.
 #
-#   docker build -t cobweb:latest .                        # flaresolverr (default)
-#   docker build --build-arg FEATURES="" \
-#                -t cobweb:lean .                           # fast-path only
+#   docker build -t cobweb:latest .                        # no optional features (default)
+#   docker build --build-arg FEATURES="flaresolverr" \
+#                -t cobweb:fs .                             # + FlareSolverr API/delegate
 #   docker build --build-arg FEATURES="flaresolverr,ytdlp" \
 #                --build-arg WITH_YTDLP=1 -t cobweb:ytdlp . # + yt-dlp binary
 #
@@ -25,7 +25,7 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
  && cargo build --release --locked --no-default-features 2>/dev/null || true
 COPY . .
 
-ARG FEATURES="flaresolverr"
+ARG FEATURES=""
 RUN touch src/main.rs src/lib.rs \
  && cargo build --release --locked --no-default-features --features "$FEATURES" \
  && strip target/release/cobweb
